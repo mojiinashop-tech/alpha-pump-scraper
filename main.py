@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +26,6 @@ LAMPORTS_PER_SOL = 1_000_000_000
 DEFAULT_COMMITMENT = "confirmed"
 DEFAULT_PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Délais (s) entre les tentatives getTransaction quand la tx n'est pas encore indexée
 TX_FETCH_DELAYS = (0.0, 0.5, 1.0)
 
 _CREATE_LOG_RE = re.compile(r"instruction:\s*create(v2)?\s*$", re.IGNORECASE)
@@ -36,7 +36,6 @@ _SECRET_PATTERNS = [
 
 
 def redact(text: str) -> str:
-    """Masque les clés API / tokens dans les messages de log."""
     for pattern, repl in _SECRET_PATTERNS:
         text = pattern.sub(repl, text)
     return text
@@ -59,7 +58,7 @@ def env(name: str, default: str = "") -> str:
 
 
 class RPCError(Exception):
-    """Erreur RPC/HTTP après épuisement des tentatives (message sans URL ni clé)."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -103,13 +102,11 @@ class Config:
             lp_mode=env("LP_VERIFICATION_MODE", "strict").lower(),
             lp_status_url_template=env("LP_STATUS_URL_TEMPLATE"),
             timeout=float(env("RPC_TIMEOUT_SECONDS", "8")),
-            # Nombre de workers de validation en parallèle (100 -> 4 : évite les rafales)
             max_concurrency=int(env("MAX_CONCURRENT_VALIDATIONS", "4")),
             reconnect_min=float(env("RECONNECT_MIN_SECONDS", "0.25")),
             reconnect_max=float(env("RECONNECT_MAX_SECONDS", "5")),
             db_path=env("DATABASE_PATH", "./data/alerts.sqlite3"),
             port=int(env("PORT", "10000")),
-            # Débit max d'appels HTTP vers Helius (req/s). Adapte selon ton plan.
             rpc_max_rps=float(env("RPC_MAX_RPS", "8")),
             rpc_max_retries=int(env("RPC_MAX_RETRIES", "4")),
             rpc_backoff_max=float(env("RPC_BACKOFF_MAX_SECONDS", "30")),
@@ -158,11 +155,6 @@ class SeenDB:
 
 
 class RateLimiter:
-    """
-    Espace les requêtes d'au moins 1/rate seconde (throttling global) et permet
-    de mettre TOUS les appels en pause après un 429 (penalize).
-    """
-
     def __init__(self, rate: float):
         self.interval = 1.0 / rate if rate > 0 else 0.0
         self._next = 0.0
@@ -179,7 +171,6 @@ class RateLimiter:
             delay = start - now
             if delay > 0:
                 await asyncio.sleep(delay)
-            # Si une pause globale a été déclenchée pendant l'attente, on repart
             if self._blocked_until <= loop.time():
                 return
 
@@ -224,7 +215,7 @@ class SolanaRPC:
                     status = response.status
                     if status == 429:
                         wait = _retry_after(response, self._backoff(attempt, base=1.0))
-                        self.limiter.penalize(wait)  # pause globale pour tous les appels
+                        self.limiter.penalize(wait)
                         last_error = "HTTP 429"
                         retry_delay = 0.0
                         LOG.warning("429 Too Many Requests (%s) - pause globale %.1fs", method, wait)
@@ -309,31 +300,23 @@ class Validator:
             return None
 
     async def validate(self, c: Candidate) -> ValidatedToken | None:
-        """
-        Validation séquentielle avec sortie anticipée : on commence par les
-        contrôles les moins chers / les plus sélectifs pour éviter des appels RPC inutiles.
-        Retourne None si le token est rejeté OU si l'API est indisponible (sans lever d'exception).
-        """
         try:
-            # 1) Liquidité (1 appel léger, rejette la grande majorité des tokens)
             curve_balance = await self.rpc.balance(c.bonding_curve)
             liquidity_sol = curve_balance / LAMPORTS_PER_SOL
             if liquidity_sol <= self.cfg.min_liquidity_sol:
                 return None
 
-            # 2) Mint authority
             mint_info = self._parsed_account(await self.rpc.account(c.mint))
             if not mint_info or mint_info.get("mintAuthority") is not None:
                 return None
 
-            # 3) LP (API externe, hors quota Helius)
             if not await self.lp.burned_100(c.mint):
                 return None
 
-            # 4) Supply + top 10 holders (hors comptes de la bonding curve)
             total_supply = await self.rpc.supply(c.mint)
             if total_supply <= 0:
                 return None
+            
             largest = await self.rpc.largest_accounts(c.mint)
             curve_accounts = await self.rpc.token_accounts_by_owner(c.bonding_curve, c.mint)
             curve_token_accounts = {x["pubkey"] for x in curve_accounts}
@@ -343,7 +326,6 @@ class Validator:
             if top10_percent >= self.cfg.max_top10_percent:
                 return None
 
-            # 5) Part du dev
             creator_accounts = await self.rpc.token_accounts_by_owner(c.creator, c.mint)
             dev_amount = sum(int(x["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) for x in creator_accounts)
             dev_percent = 100 * dev_amount / total_supply
@@ -398,7 +380,6 @@ def escape_md(value: str) -> str:
 
 
 def is_create_logs(logs: list[str]) -> bool:
-    """Vrai uniquement pour l'instruction Create / CreateV2 de Pump.fun (pas les buy/sell)."""
     return any(_CREATE_LOG_RE.search(line.strip()) for line in logs)
 
 
@@ -479,7 +460,6 @@ class Monitor:
                 db.close()
 
     async def consume_or_stop(self) -> None:
-        """Lance consume() et l'arrête proprement si SIGINT/SIGTERM est reçu."""
         consume_task = asyncio.create_task(self.consume())
         stop_task = asyncio.create_task(self.stop_event.wait())
         try:
@@ -489,4 +469,36 @@ class Monitor:
         finally:
             for t in (consume_task, stop_task):
                 if not t.done():
-         
+                    t.cancel()
+            await asyncio.gather(consume_task, stop_task, return_exceptions=True)
+
+    async def consume(self) -> None:
+        async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
+            subscription_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "logsSubscribe",
+                "params": [
+                    {"mentions": [str(self.cfg.pump_program_id)]},
+                    {"commitment": DEFAULT_COMMITMENT},
+                ],
+            }
+            await ws.send(json.dumps(subscription_payload))
+            ack = json.loads(await ws.recv())
+
+            if "error" in ack:
+                LOG.warning("Abonnement ciblé rejeté, tentative sur 'all'...")
+                fallback_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": ["all", {"commitment": DEFAULT_COMMITMENT}],
+                }
+                await ws.send(json.dumps(fallback_payload))
+                ack = json.loads(await ws.recv())
+                if "error" in ack:
+                    raise RuntimeError(f"Erreur fatale WebSocket: {ack}")
+
+            LOG.info("Connecté et abonné aux flux WebSocket Solana avec succès !")
+            async for raw in ws:
+              
