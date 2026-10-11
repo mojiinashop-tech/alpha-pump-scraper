@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-from aiohttp import web  # Indispensable pour Render
+from aiohttp import web
 import websockets
 from dotenv import load_dotenv
 
@@ -43,7 +43,7 @@ class Config:
     reconnect_min: float
     reconnect_max: float
     db_path: str
-    port: int  # Indispensable pour Render
+    port: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -297,7 +297,16 @@ class Monitor:
 
     async def consume(self, rpc: SolanaRPC, db: SeenDB, validator: Validator, telegram: Telegram) -> None:
         async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": [{"mentions": [self.cfg.pump_program_id]}, {"commitment": DEFAULT_COMMITMENT}]}))
+            # Correction de la structure JSON-RPC pour Helius (mentions formatées correctement dans un tableau)
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "logsSubscribe",
+                "params": [
+                    {"mentions": [self.cfg.pump_program_id]},
+                    {"commitment": DEFAULT_COMMITMENT}
+                ]
+            }))
             ack = json.loads(await ws.recv())
             if "error" in ack:
                 raise RuntimeError(ack)
