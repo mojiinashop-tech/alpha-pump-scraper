@@ -297,19 +297,20 @@ class Monitor:
 
     async def consume(self, rpc: SolanaRPC, db: SeenDB, validator: Validator, telegram: Telegram) -> None:
         async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
-            await ws.send(json.dumps({
+            subscription_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "logsSubscribe",
                 "params": [
-                    {"mentions": [self.cfg.pump_program_id]},
+                    {"mentions": [str(self.cfg.pump_program_id)]},
                     {"commitment": DEFAULT_COMMITMENT}
                 ]
-            }))
+            }
+            await ws.send(json.dumps(subscription_payload))
             ack = json.loads(await ws.recv())
             if "error" in ack:
-                raise RuntimeError(ack)
-            LOG.info("Abonné au programme %s", self.cfg.pump_program_id)
+                raise RuntimeError(f"Erreur d'abonnement WS: {ack}")
+            LOG.info("Abonné avec succès au programme %s", self.cfg.pump_program_id)
             async for raw in ws:
                 msg = json.loads(raw)
                 value = msg.get("params", {}).get("result", {}).get("value", {})
@@ -361,4 +362,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
