@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-from aiohttp import web  # Ajouté pour le serveur web gratuit de Render
+from aiohttp import web  # Indispensable pour Render
 import websockets
 from dotenv import load_dotenv
 
@@ -43,7 +43,7 @@ class Config:
     reconnect_min: float
     reconnect_max: float
     db_path: str
-    port: int  # Ajouté pour récupérer le port dynamique de Render
+    port: int  # Indispensable pour Render
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -67,7 +67,7 @@ class Config:
             reconnect_min=float(env("RECONNECT_MIN_SECONDS", "0.25")),
             reconnect_max=float(env("RECONNECT_MAX_SECONDS", "5")),
             db_path=env("DATABASE_PATH", "./data/alerts.sqlite3"),
-            port=int(env("PORT", "10000")),  # Port par défaut pour Render
+            port=int(env("PORT", "10000")),
         )
 
 
@@ -152,8 +152,6 @@ class SolanaRPC:
 
 
 class LPVerifier:
-    """Vérifie exclusivement une preuve explicite. Inconnu = rejet, jamais acceptation implicite."""
-
     def __init__(self, cfg: Config, session: aiohttp.ClientSession):
         self.cfg = cfg
         self.session = session
@@ -299,7 +297,7 @@ class Monitor:
 
     async def consume(self, rpc: SolanaRPC, db: SeenDB, validator: Validator, telegram: Telegram) -> None:
         async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": [{"accountInclude": [self.cfg.pump_program_id]}, {"commitment": DEFAULT_COMMITMENT}]}))
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": [{"mentions": [self.cfg.pump_program_id]}, {"commitment": DEFAULT_COMMITMENT}]}))
             ack = json.loads(await ws.recv())
             if "error" in ack:
                 raise RuntimeError(ack)
@@ -329,7 +327,6 @@ class Monitor:
                 LOG.exception("Erreur de traitement de %s", signature)
 
 
-# Mini serveur HTTP pour empêcher Render d'endormir le bot (Free Web Service)
 async def handle_health_check(request):
     return web.Response(text="Bot Alpha Pump Scraper is running!")
 
@@ -346,10 +343,7 @@ async def start_web_server(port: int):
 
 async def main() -> None:
     cfg = Config.from_env()
-    
-    # Lancement du mini-serveur HTTP en arrière-plan pour Render
     await start_web_server(cfg.port)
-    
     monitor = Monitor(cfg)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
