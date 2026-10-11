@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+from aiohttp import web  # Ajouté pour le serveur web gratuit de Render
 import websockets
 from dotenv import load_dotenv
 
@@ -42,6 +43,7 @@ class Config:
     reconnect_min: float
     reconnect_max: float
     db_path: str
+    port: int  # Ajouté pour récupérer le port dynamique de Render
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -65,6 +67,7 @@ class Config:
             reconnect_min=float(env("RECONNECT_MIN_SECONDS", "0.25")),
             reconnect_max=float(env("RECONNECT_MAX_SECONDS", "5")),
             db_path=env("DATABASE_PATH", "./data/alerts.sqlite3"),
+            port=int(env("PORT", "10000")),  # Port par défaut pour Render
         )
 
 
@@ -326,8 +329,27 @@ class Monitor:
                 LOG.exception("Erreur de traitement de %s", signature)
 
 
+# Mini serveur HTTP pour empêcher Render d'endormir le bot (Free Web Service)
+async def handle_health_check(request):
+    return web.Response(text="Bot Alpha Pump Scraper is running!")
+
+async def start_web_server(port: int):
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    app.router.add_get('/health', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    LOG.info(f"Serveur web de santé actif sur le port {port}")
+
+
 async def main() -> None:
     cfg = Config.from_env()
+    
+    # Lancement du mini-serveur HTTP en arrière-plan pour Render
+    await start_web_server(cfg.port)
+    
     monitor = Monitor(cfg)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -337,4 +359,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-              
+    
