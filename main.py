@@ -297,7 +297,6 @@ class Monitor:
 
     async def consume(self, rpc: SolanaRPC, db: SeenDB, validator: Validator, telegram: Telegram) -> None:
         async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
-            # Correction de la structure JSON-RPC pour Helius (mentions formatées correctement dans un tableau)
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": 1,
