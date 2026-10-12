@@ -222,11 +222,7 @@ def iter_instructions(tx: dict[str, Any]):
 
 
 def parse_creation(tx: dict[str, Any], signature: str, program_id: str) -> Candidate | None:
-    """Extrait mint / courbe / créateur de la transaction de création.
-
-    Indices des comptes de l'instruction Create : 0 mint, 2 bonding curve, 3 ATA de la courbe.
-    Le créateur est le fee payer (premier compte). À vérifier si Pump.fun change son IDL.
-    """
+    """Extrait mint / courbe / créateur de la transaction de création."""
     meta = tx.get("meta") or {}
     if meta.get("err"):
         return None
@@ -238,7 +234,7 @@ def parse_creation(tx: dict[str, Any], signature: str, program_id: str) -> Candi
         if ix.get("programId") != program_id or len(accts) < 4:
             continue
         mint = accts[0]
-        if not any(b.get("mint") == mint for b in post):  # confirme que accts[0] est bien un mint
+        if not any(b.get("mint") == mint for b in post):
             continue
         dev_raw = sum(
             int(b["uiTokenAmount"]["amount"])
@@ -271,7 +267,7 @@ class SeenDB:
         self.lock = asyncio.Lock()
 
     async def _run(self, fn, *args):
-        async with self.lock:  # sqlite est synchrone : thread + verrou = boucle jamais bloquée
+        async with self.lock:
             return await asyncio.to_thread(fn, *args)
 
     def _claim(self, mint: str, signature: str) -> bool:
@@ -312,15 +308,13 @@ class SeenDB:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# RPC HELIUS (limiteur + retry/backoff + gestion du 429)
+# RPC HELIUS
 # ════════════════════════════════════════════════════════════════════════════
 class RpcError(Exception):
     pass
 
 
 class RateLimiter:
-    """Lisse les requêtes (1/rps s minimum entre deux) et permet une pause globale sur 429."""
-
     def __init__(self, rps: float):
         self.interval = 1.0 / max(rps, 0.1)
         self._next = 0.0
@@ -369,19 +363,19 @@ class SolanaRPC:
                     if resp.status == 429 or resp.status >= 500:
                         wait = retry_after(resp.headers, delay)
                         if resp.status == 429:
-                            self._limiter.penalize(wait)  # tous les workers ralentissent
+                            self._limiter.penalize(wait)
                         last = f"HTTP {resp.status}"
                     else:
                         resp.raise_for_status()
                         payload = await resp.json(content_type=None)
-            except aiohttp.ClientResponseError as exc:  # 4xx hors 429 : inutile de réessayer
+            except aiohttp.ClientResponseError as exc:
                 raise RpcError(f"{method}: HTTP {exc.status}") from None
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                wait, last = delay, type(exc).__name__  # jamais str(exc) : l'URL contient la clé API
+                wait, last = delay, type(exc).__name__
             if wait is None:
                 err = payload.get("error")
                 if err:
-                    if isinstance(err, dict) and err.get("code") == -32005:  # nœud surchargé
+                    if isinstance(err, dict) and err.get("code") == -32005:
                         wait, last = delay, "-32005"
                     else:
                         raise RpcError(f"{method}: {err}")
@@ -393,16 +387,15 @@ class SolanaRPC:
 
     async def transaction(self, signature: str) -> dict[str, Any] | None:
         return await self.call("getTransaction", [signature, {
-            "encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
+            "encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}])
 
 
 async def fetch_curves(rpc: SolanaRPC, addresses: list[str], program_id: str) -> list[CurveState | None]:
-    """Lit jusqu'à 100 courbes en UN appel. None = compte absent, faux (mauvais owner) ou illisible."""
     res = await rpc.call("getMultipleAccounts", [addresses, {"encoding": "base64", "commitment": "confirmed"}])
     out: list[CurveState | None] = []
     for acc in (res or {}).get("value", []):
         state = None
-        if acc and acc.get("owner") == program_id:  # anti-faux compte : doit appartenir au programme Pump
+        if acc and acc.get("owner") == program_id:
             try:
                 state = parse_curve(base64.b64decode(acc["data"][0]))
             except (KeyError, IndexError, TypeError, ValueError):
@@ -447,11 +440,10 @@ class Validator:
         return total
 
     async def _bundles(self, cand: Candidate) -> tuple[bool, str, float]:
-        """Achats dans le même bloc (slot) que la création, hors transaction de création."""
         sigs: list[dict[str, Any]] = []
         before = None
         complete = False
-        for _ in range(3):  # jusqu'à 3000 signatures
+        for _ in range(3):
             opts: dict[str, Any] = {"limit": 1000, "commitment": "confirmed"}
             if before:
                 opts["before"] = before
@@ -487,7 +479,6 @@ class Validator:
         cfg = self.cfg
         v = Verdict(cand, liquidity_sol=curve.liquidity_sol)
 
-        # 1) Liquidité : seuils + liquidité détenue par le programme (pas de LP retirable avant migration)
         liq = curve.liquidity_sol
         v.add("Liquidité", cfg.min_liquidity_sol <= liq <= cfg.max_liquidity_sol,
               f"{liq:.2f} SOL réels (min {cfg.min_liquidity_sol}, max {cfg.max_liquidity_sol})")
@@ -496,7 +487,6 @@ class Validator:
         if not v.ok:
             return v
 
-        # 2-4) Appels indépendants en parallèle
         (mint_auth, freeze_auth), largest, dev_raw = await asyncio.gather(
             self._mint_authorities(cand.mint), self._largest(cand.mint), self._dev_balance(cand))
 
@@ -517,7 +507,6 @@ class Validator:
         if not v.ok:
             return v
 
-        # 5) Bundles (le plus coûteux : uniquement si tout le reste est passé)
         ok, detail, v.bundle_percent = await self._bundles(cand)
         v.add("Bundles bloc 0", ok, detail)
         return v
@@ -548,12 +537,11 @@ class Telegram:
                         return False
                     return True
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                log.warning("Telegram: %s", type(exc).__name__)  # pas de str(exc) : l'URL contient le token
+                log.warning("Telegram: %s", type(exc).__name__)
                 await asyncio.sleep(2)
         return False
 
     async def poll_commands(self, handler) -> None:
-        """Commandes /pause /resume /status, uniquement depuis TELEGRAM_CHAT_ID."""
         offset = 0
         while True:
             try:
@@ -570,7 +558,7 @@ class Telegram:
                         await self.send(await handler(text.split()[0].split("@")[0]))
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.warning("Telegram polling: %s", type(exc).__name__)
                 await asyncio.sleep(5)
 
@@ -598,340 +586,15 @@ def format_alert(v: Verdict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# EXÉCUTION (achat) + GARDE-FOUS
+# EXÉCUTION & GARDE-FOUS
 # ════════════════════════════════════════════════════════════════════════════
 class PumpPortalExecutor:
-    """Construit la transaction via l'API « trade-local » (clé privée jamais envoyée),
-    la signe localement puis l'envoie via Helius. Interface remplaçable par un builder direct."""
-
     def __init__(self, cfg: Config, session: aiohttp.ClientSession, rpc: SolanaRPC):
-        from solders.keypair import Keypair  # import tardif : inutile hors achat réel
+        from solders.keypair import Keypair
 
         self.cfg, self.session, self.rpc = cfg, session, rpc
         self._keypair = Keypair.from_base58_string(cfg.wallet_private_key)
         self.pubkey = str(self._keypair.pubkey())
 
     async def balance_sol(self) -> float:
-        res = await self.rpc.call("getBalance", [self.pubkey, {"commitment": "confirmed"}])
-        return float((res or {}).get("value", 0)) / LAMPORTS
-
-    async def buy(self, mint: str) -> str:
-        from solders.transaction import VersionedTransaction
-
-        payload = {
-            "publicKey": self.pubkey, "action": "buy", "mint": mint,
-            "amount": self.cfg.buy_amount_sol, "denominatedInSol": "true",
-            "slippage": self.cfg.slippage_percent, "priorityFee": self.cfg.priority_fee_sol, "pool": "pump",
-        }
-        async with self.session.post(self.cfg.trade_api_url, json=payload,
-                                     timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"API trade HTTP {resp.status}")
-            raw = await resp.read()
-        unsigned = VersionedTransaction.from_bytes(raw)
-        signed = VersionedTransaction(unsigned.message, [self._keypair])
-        encoded = base64.b64encode(bytes(signed)).decode()
-        return await self.rpc.call("sendTransaction", [encoded, {
-            "encoding": "base64", "skipPreflight": False, "preflightCommitment": "processed", "maxRetries": 3}])
-
-    async def confirm(self, signature: str, timeout: float = 40.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            res = await self.rpc.call("getSignatureStatuses", [[signature], {"searchTransactionHistory": False}])
-            status = ((res or {}).get("value") or [None])[0]
-            if status:
-                if status.get("err"):
-                    return False
-                if status.get("confirmationStatus") in {"confirmed", "finalized"}:
-                    return True
-            await asyncio.sleep(1.5)
-        return False
-
-
-class RiskGuard:
-    def __init__(self, cfg: Config, db: SeenDB, executor: PumpPortalExecutor | None):
-        self.cfg, self.db, self.executor = cfg, db, executor
-        self.paused = False
-
-    async def can_buy(self) -> tuple[bool, str]:
-        if self.paused:
-            return False, "achats en pause (/resume)"
-        now = time.time()
-        if await self.db.count_trades(now - 3600) >= self.cfg.max_buys_per_hour:
-            return False, f"limite de {self.cfg.max_buys_per_hour} achats/heure atteinte"
-        if await self.db.spent(now - 86400) + self.cfg.buy_amount_sol > self.cfg.max_daily_spend_sol:
-            return False, f"plafond de {self.cfg.max_daily_spend_sol} SOL/24h atteint"
-        if self.executor:
-            balance = await self.executor.balance_sol()
-            if balance < self.cfg.buy_amount_sol + self.cfg.min_wallet_reserve_sol:
-                return False, f"solde insuffisant ({balance:.3f} SOL)"
-        return True, "ok"
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# ORCHESTRATEUR
-# ════════════════════════════════════════════════════════════════════════════
-class Sniper:
-    def __init__(self, cfg: Config, session: aiohttp.ClientSession, db: SeenDB):
-        self.cfg, self.session, self.db = cfg, session, db
-        self.rpc = SolanaRPC(cfg, session)
-        self.tg = Telegram(cfg, session)
-        self.validator = Validator(cfg, self.rpc)
-        self.executor = (PumpPortalExecutor(cfg, session, self.rpc)
-                         if cfg.auto_buy and not cfg.dry_run else None)
-        self.guard = RiskGuard(cfg, db, self.executor)
-        self.sig_queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue(maxsize=2000)
-        self.val_queue: asyncio.Queue[tuple[Candidate, CurveState]] = asyncio.Queue()
-        self.watch: dict[str, Candidate] = {}
-        self.stats: Counter[str] = Counter()
-        self._buy_lock = asyncio.Lock()
-        self._tasks: set[asyncio.Task] = set()
-
-    def _spawn(self, coro) -> None:
-        task = asyncio.create_task(coro)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    def coroutines(self) -> list:
-        return [
-            self.listen(), self.watch_loop(), self.stats_loop(),
-            self.tg.poll_commands(self.on_command),
-            *[self.ingest_worker() for _ in range(3)],
-            *[self.validation_worker() for _ in range(self.cfg.max_concurrency)],
-        ]
-
-    # ── 1. WebSocket ────────────────────────────────────────────────────────
-    async def listen(self) -> None:
-        delay = self.cfg.reconnect_min
-        sub = {"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-               "params": [{"mentions": [self.cfg.pump_program_id]}, {"commitment": "confirmed"}]}
-        while True:
-            try:
-                async with self.session.ws_connect(self.cfg.ws_url, heartbeat=20) as ws:
-                    await ws.send_json(sub)
-                    log.info("WebSocket connecté")
-                    async for msg in ws:
-                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        data = json.loads(msg.data)
-                        if data.get("error"):
-                            raise RuntimeError(f"abonnement refusé: {data['error']}")
-                        result = (data.get("params") or {}).get("result")
-                        if not result:
-                            continue  # accusé de réception de l'abonnement
-                        delay = self.cfg.reconnect_min
-                        value = result["value"]
-                        logs = value.get("logs") or []
-                        if value.get("err") or not any(l.startswith(CREATE_LOG_PREFIX) for l in logs):
-                            continue
-                        try:
-                            self.sig_queue.put_nowait((value["signature"], result["context"]["slot"]))
-                            self.stats["detected"] += 1
-                        except asyncio.QueueFull:
-                            self.stats["dropped"] += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning("WebSocket: %s — reconnexion dans %.1fs", type(exc).__name__, delay)
-            await asyncio.sleep(delay + random.uniform(0, 0.5))
-            delay = min(delay * 2, self.cfg.reconnect_max)
-
-    # ── 2. Ingestion ────────────────────────────────────────────────────────
-    async def ingest_worker(self) -> None:
-        while True:
-            signature, _slot = await self.sig_queue.get()
-            try:
-                await self._ingest(signature)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — un token en erreur ne doit jamais tuer le worker
-                self.stats["ingest_error"] += 1
-                log.warning("ingestion %s: %s", signature[:8], exc if isinstance(exc, RpcError) else type(exc).__name__)
-
-    async def _ingest(self, signature: str) -> None:
-        tx = None
-        for _ in range(4):  # l'indexation peut avoir quelques centaines de ms de retard
-            tx = await self.rpc.transaction(signature)
-            if tx:
-                break
-            await asyncio.sleep(0.6)
-        cand = parse_creation(tx, signature, self.cfg.pump_program_id) if tx else None
-        if cand is None:
-            self.stats["not_creation"] += 1
-            return
-        if not await self.db.claim(cand.mint, signature):
-            self.stats["duplicate"] += 1
-            return
-        # Filtre dev immédiat (base « total », plus permissive que « circulating » : rejet toujours valide)
-        if cand.dev_initial_raw / TOTAL_SUPPLY_RAW * 100 > self.cfg.max_dev_percent:
-            self.stats["reject_dev_initial"] += 1
-            return
-        if len(self.watch) >= self.cfg.watch_max:
-            self.stats["watch_full"] += 1
-            return
-        self.watch[cand.mint] = cand
-
-    # ── 3. Watchlist : 1 appel RPC pour jusqu'à 100 tokens ─────────────────
-    async def watch_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.watch_interval)
-            items = list(self.watch.values())
-            for i in range(0, len(items), 100):
-                chunk = items[i:i + 100]
-                try:
-                    curves = await fetch_curves(self.rpc, [c.bonding_curve for c in chunk], self.cfg.pump_program_id)
-                except RpcError as exc:
-                    log.warning("watchlist: %s", exc)
-                    continue
-                now = time.time()
-                for cand, curve in zip(chunk, curves):
-                    age = now - cand.created_at
-                    if curve is None:
-                        if age > 15:
-                            self.watch.pop(cand.mint, None)
-                            self.stats["reject_bad_curve"] += 1
-                    elif curve.complete or age > self.cfg.watch_ttl:
-                        self.watch.pop(cand.mint, None)
-                        self.stats["expired"] += 1
-                    elif curve.liquidity_sol > self.cfg.max_liquidity_sol:
-                        self.watch.pop(cand.mint, None)
-                        self.stats["too_late"] += 1
-                    elif curve.liquidity_sol >= self.cfg.min_liquidity_sol:
-                        self.watch.pop(cand.mint, None)
-                        self.val_queue.put_nowait((cand, curve))
-
-    # ── 4. Validation ───────────────────────────────────────────────────────
-    async def validation_worker(self) -> None:
-        while True:
-            cand, curve = await self.val_queue.get()
-            try:
-                verdict = await self.validator.validate(cand, curve)
-                if verdict.ok:
-                    self.stats["valid"] += 1
-                    await self._on_valid(verdict)
-                else:
-                    self.stats["rejected"] += 1
-                    log.info("✗ %s… %s", cand.mint[:6], verdict.failure)
-            except asyncio.CancelledError:
-                raise
-            except RpcError as exc:  # erreur réseau/RPC transitoire : on saute ce token, la boucle continue
-                self.stats["validation_error"] += 1
-                log.warning("validation %s…: %s", cand.mint[:6], exc)
-            except Exception:  # noqa: BLE001
-                self.stats["validation_error"] += 1
-                log.exception("validation inattendue pour %s…", cand.mint[:6])
-
-    async def _on_valid(self, v: Verdict) -> None:
-        self._spawn(self.tg.send(format_alert(v)))  # l'alerte ne retarde pas l'achat
-        if self.cfg.auto_buy:
-            await self._try_buy(v)
-
-    async def _try_buy(self, v: Verdict) -> None:
-        c = v.candidate
-        async with self._buy_lock:  # sérialise les achats : pas de dépassement de plafond en parallèle
-            ok, why = await self.guard.can_buy()
-            if not ok:
-                self._spawn(self.tg.send(f"⏭️ Achat ignoré : {why}"))
-                return
-            # Re-vérification éclair juste avant d'acheter
-            curve = (await fetch_curves(self.rpc, [c.bonding_curve], self.cfg.pump_program_id))[0]
-            if (curve is None or curve.complete
-                    or not self.cfg.min_liquidity_sol <= curve.liquidity_sol <= self.cfg.max_liquidity_sol):
-                self._spawn(self.tg.send("⏭️ Achat annulé : la courbe a changé depuis la validation."))
-                return
-            if self.cfg.dry_run or self.executor is None:
-                self._spawn(self.tg.send(f"🧪 <b>[DRY-RUN]</b> achat simulé de {self.cfg.buy_amount_sol} SOL "
-                                         f"sur <code>{c.mint}</code>"))
-                return
-            try:
-                signature = await self.executor.buy(c.mint)
-            except (RpcError, RuntimeError) as exc:
-                self.stats["buy_failed"] += 1
-                self._spawn(self.tg.send(f"❌ Achat échoué : {exc}"))
-                return
-            await self.db.add_trade(c.mint, signature, self.cfg.buy_amount_sol)  # compté même si non confirmé
-            self.stats["buy_sent"] += 1
-        confirmed = await self.executor.confirm(signature)
-        icon = "✅ Achat confirmé" if confirmed else "⚠️ Achat envoyé, non confirmé (vérifie Solscan)"
-        await self.tg.send(f'{icon} : {self.cfg.buy_amount_sol} SOL sur <code>{c.mint}</code>\n'
-                           f'<a href="https://solscan.io/tx/{signature}">Transaction</a>')
-
-    # ── Commandes Telegram / stats ──────────────────────────────────────────
-    async def on_command(self, cmd: str) -> str:
-        if cmd == "/pause":
-            self.guard.paused = True
-            return "⏸️ Achats en pause (les alertes continuent)."
-        if cmd == "/resume":
-            self.guard.paused = False
-            return "▶️ Achats réactivés."
-        if cmd == "/status":
-            balance = ""
-            if self.executor:
-                try:
-                    balance = f"\nSolde wallet : {await self.executor.balance_sol():.3f} SOL"
-                except RpcError:
-                    balance = "\nSolde wallet : indisponible"
-            return (f"Mode : {self.cfg.mode_label}{' (en pause)' if self.guard.paused else ''}\n"
-                    f"Watchlist : {len(self.watch)} · file validation : {self.val_queue.qsize()}\n"
-                    f"{dict(self.stats)}{balance}")
-        return "Commandes : /status /pause /resume"
-
-    async def stats_loop(self) -> None:
-        while True:
-            await asyncio.sleep(60)
-            log.info("watch=%d val_q=%d %s", len(self.watch), self.val_queue.qsize(), dict(self.stats))
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
-async def start_health_server(sniper: Sniper) -> web.AppRunner | None:
-    port = env("PORT")
-    if not port:  # Background Worker : pas de port nécessaire
-        return None
-
-    async def health(_: web.Request) -> web.Response:
-        return web.json_response({"status": "ok", "watch": len(sniper.watch), "mode": sniper.cfg.mode_label})
-
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
-    return runner
-
-
-async def main() -> None:
-    logging.basicConfig(level=env("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("aiohttp").setLevel(logging.WARNING)
-    cfg = Config.from_env()
-    db = SeenDB(cfg.db_path)
-    loop = asyncio.get_running_loop()
-    main_task = asyncio.current_task()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, main_task.cancel)  # arrêt propre sur SIGTERM (Render)
-        except NotImplementedError:
-            pass
-    runner = None
-    try:
-        async with aiohttp.ClientSession() as session:
-            sniper = Sniper(cfg, session, db)
-            runner = await start_health_server(sniper)
-            log.info("Démarrage — mode : %s", cfg.mode_label)
-            await sniper.tg.send(f"🚀 Bot démarré — mode <b>{cfg.mode_label}</b>\n/status · /pause · /resume")
-            await asyncio.gather(*sniper.coroutines())
-    finally:
-        if runner:
-            await runner.cleanup()
-        db.close()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        res = await self.rpc
