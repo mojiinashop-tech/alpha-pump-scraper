@@ -22,6 +22,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("QuantumAlphaSniper")
+for _logger_name in ("telegram", "httpx", "httpcore"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 PUMP_PROGRAM_ID = os.getenv("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 DEFAULT_COMMITMENT = os.getenv("SOLANA_COMMITMENT", "confirmed")
