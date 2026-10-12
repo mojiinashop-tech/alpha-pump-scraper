@@ -1,3 +1,2 @@
-websockets
-aiohttp
-python-dotenv
+aiohttp>=3.9
+solders>=0.21
