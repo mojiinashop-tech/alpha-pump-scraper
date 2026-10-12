@@ -161,22 +161,51 @@ class HeliusMonitor:
             f"https://mainnet.helius-rpc.com/?api-key={self.api_key}" if self.api_key else ""
         )
         self.stop_event = asyncio.Event()
-        self.semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_EVENTS", "100")))
+        self.rpc_workers = max(1, int(os.getenv("RPC_WORKERS", "4")))
+        self.event_queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(
+            maxsize=max(10, int(os.getenv("EVENT_QUEUE_SIZE", "500")))
+        )
+        self.enqueued_signatures: set[str] = set()
+        self.enqueue_lock = asyncio.Lock()
 
     async def rpc(self, method: str, params: list[Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        async with self.session.post(self.rpc_url, json=payload, timeout=10) as response:
-            response.raise_for_status()
-            body = await response.json()
+        for attempt in range(4):
+            try:
+                async with self.session.post(self.rpc_url, json=payload, timeout=10) as response:
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        wait = float(retry_after) if retry_after else min(4.0, 0.5 * (2 ** attempt))
+                        logger.warning("RPC rate limité pour %s; nouvelle tentative dans %.1fs", method, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if response.status >= 400:
+                        logger.warning("RPC HTTP %s pour %s", response.status, method)
+                        raise RuntimeError(f"RPC HTTP {response.status} for {method}") from None
+                    body = await response.json()
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt == 3:
+                    logger.warning("RPC indisponible pour %s après retries: %s", method, type(exc).__name__)
+                    raise RuntimeError(f"RPC unavailable for {method}") from None
+                await asyncio.sleep(min(4.0, 0.5 * (2 ** attempt)))
+        else:
+            raise RuntimeError(f"RPC rate limité pour {method}") from None
         if body.get("error"):
             raise RuntimeError(body["error"])
         return body.get("result")
 
     async def transaction(self, signature: str) -> Optional[dict[str, Any]]:
-        return await self.rpc("getTransaction", [signature, {
+        params = [signature, {
             "encoding": "jsonParsed", "commitment": DEFAULT_COMMITMENT,
             "maxSupportedTransactionVersion": 0,
-        }])
+        }]
+        for attempt in range(3):
+            tx = await self.rpc("getTransaction", params)
+            if tx:
+                return tx
+            await asyncio.sleep((0.25, 0.5, 1.0)[attempt])
+        return None
 
     @staticmethod
     def candidate_from_transaction(tx: dict[str, Any], signature: str) -> Optional[Dict[str, Any]]:
@@ -206,58 +235,89 @@ class HeliusMonitor:
         if not template:
             return {**candidate, "dex_paid": False, "market_cap_usd": 0}
         url = template.format(mint=candidate["mint"])
-        async with self.session.get(url, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
+        try:
+            async with self.session.get(url, timeout=10) as response:
+                if response.status >= 400:
+                    logger.warning("Source métriques HTTP %s", response.status)
+                    return {**candidate, "dex_paid": False, "market_cap_usd": 0}
+                data = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.warning("Source métriques indisponible pour %s", candidate["mint"])
+            return {**candidate, "dex_paid": False, "market_cap_usd": 0}
         return {**candidate, **data}
 
     async def process(self, signature: str, logs: list[str]) -> None:
-        async with self.semaphore:
+        try:
+            tx = await self.transaction(signature)
+            candidate = self.candidate_from_transaction(tx, signature) if tx else None
+            if not candidate or not await self.store.claim(candidate["mint"], signature):
+                return
+            data = await self.enrich(candidate)
+            score, valid, reason = self.engine.evaluate_token(data)
+            if valid:
+                logger.info("[FILTER PASSED] %s score=%.2f", candidate["mint"], score)
+                await self.notifier.send_alpha_alert(data, score)
+            else:
+                logger.info("[FILTER REJECTED: %s] %s", reason, candidate["mint"])
+        except Exception as exc:
+            logger.warning("Erreur de traitement de %s: %s", signature, type(exc).__name__)
+
+    async def enqueue(self, signature: str, logs: list[str]) -> None:
+        async with self.enqueue_lock:
+            if signature in self.enqueued_signatures:
+                return
+            if self.event_queue.full():
+                logger.warning("File d’événements pleine; événement ignoré pour préserver le service")
+                return
+            self.enqueued_signatures.add(signature)
+            await self.event_queue.put((signature, logs))
+
+    async def worker(self) -> None:
+        while not self.stop_event.is_set():
+            signature, logs = await self.event_queue.get()
             try:
-                tx = await self.transaction(signature)
-                candidate = self.candidate_from_transaction(tx, signature) if tx else None
-                if not candidate or not await self.store.claim(candidate["mint"], signature):
-                    return
-                data = await self.enrich(candidate)
-                score, valid, reason = self.engine.evaluate_token(data)
-                if valid:
-                    await self.notifier.send_alpha_alert(data, score)
-                else:
-                    logger.debug("Token rejeté %s: %s", candidate["mint"], reason)
-            except Exception:
-                logger.exception("Erreur de traitement de %s", signature)
+                await self.process(signature, logs)
+            finally:
+                self.enqueued_signatures.discard(signature)
+                self.event_queue.task_done()
 
     async def run(self):
         if not self.ws_url or not self.rpc_url:
             raise RuntimeError("HELIUS_API_KEY ou HELIUS_WS_URL/HELIUS_RPC_URL manquant")
+        workers = [asyncio.create_task(self.worker()) for _ in range(self.rpc_workers)]
         delay = 0.25
-        while not self.stop_event.is_set():
-            try:
-                async with self.session.ws_connect(self.ws_url, heartbeat=10, receive_timeout=30, max_msg_size=2**20) as ws:
-                    await ws.send_json({
-                        "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                        "params": [{"mentions": [PUMP_PROGRAM_ID]}, {"commitment": DEFAULT_COMMITMENT}],
-                    })
-                    ack = await ws.receive_json()
-                    if "error" in ack:
-                        raise RuntimeError(ack["error"])
-                    logger.info("Souscription Helius active sur %s", PUMP_PROGRAM_ID)
-                    delay = 0.25
-                    async for message in ws:
-                        if message.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        payload = json.loads(message.data)
-                        value = payload.get("params", {}).get("result", {}).get("value", {})
-                        if value.get("err") or not value.get("signature"):
-                            continue
-                        asyncio.create_task(self.process(value["signature"], value.get("logs", [])))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("WebSocket Helius coupé: %s; reconnexion dans %.2fs", exc, delay)
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
-                delay = min(5.0, delay * 2)
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    async with self.session.ws_connect(self.ws_url, heartbeat=10, receive_timeout=30, max_msg_size=2**20) as ws:
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                            "params": [{"mentions": [PUMP_PROGRAM_ID]}, {"commitment": DEFAULT_COMMITMENT}],
+                        })
+                        ack = await ws.receive_json()
+                        if "error" in ack:
+                            raise RuntimeError(ack["error"])
+                        logger.info("Souscription Helius active sur %s; workers=%s", PUMP_PROGRAM_ID, self.rpc_workers)
+                        delay = 0.25
+                        async for message in ws:
+                            if message.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            payload = json.loads(message.data)
+                            value = payload.get("params", {}).get("result", {}).get("value", {})
+                            if value.get("err") or not value.get("signature"):
+                                continue
+                            await self.enqueue(value["signature"], value.get("logs", []))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("WebSocket Helius coupé: %s (%s); reconnexion dans %.2fs", type(exc).__name__, str(exc)[:120], delay)
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+                    delay = min(5.0, delay * 2)
+        finally:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 async def handle_health(request: web.Request) -> web.Response:
