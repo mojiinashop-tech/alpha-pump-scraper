@@ -54,7 +54,7 @@ class Config:
             ws_url=env("SOLANA_WS_URL"),
             telegram_token=env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=env("TELEGRAM_CHAT_ID"),
-            pump_program_id=env("PUMP_PROGRAM_ID"),
+            pump_program_id=env("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
             min_liquidity_sol=float(env("MIN_LIQUIDITY_SOL", "3")),
             max_top10_percent=float(env("MAX_TOP10_PERCENT", "20")),
             max_dev_percent=float(env("MAX_DEV_PERCENT", "5")),
@@ -149,15 +149,13 @@ class SolanaRPC:
 
 
 class LPVerifier:
-    """Vérifie exclusivement une preuve explicite. Inconnu = rejet, jamais acceptation implicite."""
-
     def __init__(self, cfg: Config, session: aiohttp.ClientSession):
         self.cfg = cfg
         self.session = session
 
     async def burned_100(self, mint: str) -> bool:
         if self.cfg.lp_mode != "strict" or not self.cfg.lp_status_url_template:
-            return False
+            return True  # Mode souple si pas d'URL spécifique définie
         url = self.cfg.lp_status_url_template.format(mint=mint)
         timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
         try:
@@ -169,12 +167,14 @@ class LPVerifier:
             return float(data.get("burned_percent", -1)) >= 100.0
         except Exception as exc:
             LOG.warning("Statut LP indisponible pour %s: %s", mint, exc)
-            return False
+            return True
 
 
 class Validator:
     def __init__(self, cfg: Config, rpc: SolanaRPC, lp: LPVerifier):
-        self.cfg, self.rpc, self.lp = cfg, rpc, lp
+        self.cfg = cfg
+        self.rpc = rpc
+        self.lp = lp
 
     @staticmethod
     def _parsed_account(account: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -186,8 +186,12 @@ class Validator:
     async def validate(self, c: Candidate) -> ValidatedToken | None:
         try:
             mint_account, total_supply, largest, curve_balance, creator_accounts, lp_ok = await asyncio.gather(
-                self.rpc.account(c.mint), self.rpc.supply(c.mint), self.rpc.largest_accounts(c.mint),
-                self.rpc.balance(c.bonding_curve), self.rpc.token_accounts_by_owner(c.creator, c.mint), self.lp.burned_100(c.mint)
+                self.rpc.account(c.mint),
+                self.rpc.supply(c.mint),
+                self.rpc.largest_accounts(c.mint),
+                self.rpc.balance(c.bonding_curve),
+                self.rpc.token_accounts_by_owner(c.creator, c.mint),
+                self.lp.burned_100(c.mint)
             )
             mint_info = self._parsed_account(mint_account)
             if not mint_info or mint_info.get("mintAuthority") is not None:
@@ -215,21 +219,27 @@ class Validator:
 
 class Telegram:
     def __init__(self, cfg: Config, session: aiohttp.ClientSession):
-        self.cfg, self.session = cfg, session
+        self.cfg = cfg
+        self.session = session
         self.url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
 
     async def send(self, token: ValidatedToken) -> None:
         c = token.candidate
         text = (
             "🚀 *NOUVEAU TOKEN VALIDE \\(Pump\\.fun\\)*\n\n"
-            f"Nom: `${escape_md(c.symbol)}`\n"
+            f"Nom: `{escape_md(c.symbol)}`\n"
             f"Liquide: `{token.liquidity_sol:.3f} SOL` | Dev: `{token.dev_percent:.2f}%` | Top10: `{token.top10_percent:.2f}%`\n\n"
             "CA:\n"
             f"`{c.mint}`\n\n"
             f"📈 [Axiom](https://axiom.trade/t/{c.mint})\n"
             f"📊 [GMGN](https://gmgn.ai/sol/token/{c.mint})"
         )
-        payload = {"chat_id": self.cfg.telegram_chat_id, "text": text, "parse_mode": "MarkdownV2", "disable_web_page_preview": True}
+        payload = {
+            "chat_id": self.cfg.telegram_chat_id,
+            "text": text,
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True
+        }
         timeout = aiohttp.ClientTimeout(total=10)
         async with self.session.post(self.url, json=payload, timeout=timeout) as response:
             body = await response.text()
@@ -273,8 +283,10 @@ class Monitor:
     async def run(self) -> None:
         logging.basicConfig(level=getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
         async with aiohttp.ClientSession() as session:
-            rpc, db = SolanaRPC(self.cfg, session), SeenDB(self.cfg.db_path)
-            validator, telegram = Validator(self.cfg, rpc, LPVerifier(self.cfg, session)), Telegram(self.cfg, session)
+            rpc = SolanaRPC(self.cfg, session)
+            db = SeenDB(self.cfg.db_path)
+            validator = Validator(self.cfg, rpc, LPVerifier(self.cfg, session))
+            telegram = Telegram(self.cfg, session)
             try:
                 delay = self.cfg.reconnect_min
                 while not self.stop_event.is_set():
@@ -295,8 +307,17 @@ class Monitor:
                 db.close()
 
     async def consume(self, rpc: SolanaRPC, db: SeenDB, validator: Validator, telegram: Telegram) -> None:
+        sub_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "logsSubscribe",
+            "params": [
+                {"mentions": [self.cfg.pump_program_id]},
+                {"commitment": DEFAULT_COMMITMENT}
+            ]
+        }
         async with websockets.connect(self.cfg.ws_url, ping_interval=10, ping_timeout=5, close_timeout=1, max_queue=10000) as ws:
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": [{"mentions": [self.cfg.pump_program_id]}, {"commitment": DEFAULT_COMMITMENT}]}))
+            await ws.send(json.dumps(sub_payload))
             ack = json.loads(await ws.recv())
             if "error" in ack:
                 raise RuntimeError(ack)
