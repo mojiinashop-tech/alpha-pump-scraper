@@ -40,6 +40,7 @@ class QuantumAlphaEngine:
         self.max_dev = max_dev
         self.max_bundle = max_bundle
         self.min_score = min_score
+        self.require_dex_paid = os.getenv("REQUIRE_DEX_PAID", "true").strip().lower() not in {"0", "false", "no", "off"}
         self.elite_wallets = {w.strip() for w in os.getenv("ELITE_WALLETS", "").split(",") if w.strip()}
 
     def evaluate_token(self, data: Dict[str, Any]) -> tuple[float, bool, str]:
@@ -56,7 +57,7 @@ class QuantumAlphaEngine:
 
         if not mint or mint == "Inconnu":
             return 0.0, False, "Mint absent"
-        if not dex_paid:
+        if self.require_dex_paid and not dex_paid:
             return 0.0, False, "DEX non payé (donnée absente ou non vérifiée)"
         if not (self.min_liq < liq <= self.max_liq):
             return 0.0, False, f"Liquidité hors zone ({liq:.2f} SOL)"
@@ -110,7 +111,7 @@ class TelegramNotifier:
             f"🪙 <b>Nom :</b> {name} (<b>${symbol}</b>)\n"
             f"💧 <b>Liquidité :</b> {liq:.2f} SOL\n"
             f"📊 <b>Market Cap :</b> ${mc:,.2f}\n"
-            f"⚙️ <b>Statut DEX :</b> Payé ✅ | Taxe : {tax}%\n"
+            f"⚙️ <b>Statut DEX :</b> {'Payé ✅' if data.get('dex_paid') else 'Non vérifié ⚠️'} | Taxe : {tax}%\n"
             f"👥 <b>Top 10 Holders :</b> {top10}%\n"
             f"💻 <b>Dev Wallet :</b> {dev}%\n"
             f"📦 <b>Bundlers :</b> {bundle}%\n\n"
@@ -169,8 +170,30 @@ class HeliusMonitor:
         self.event_queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(
             maxsize=max(10, int(os.getenv("EVENT_QUEUE_SIZE", "500")))
         )
+        self.observation_mode = os.getenv("OBSERVATION_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.summary_every = max(1, int(os.getenv("SUMMARY_EVERY", "25")))
+        self.stats = {"received": 0, "candidates": 0, "passed": 0, "rejected": 0, "errors": 0}
         self.enqueued_signatures: set[str] = set()
         self.enqueue_lock = asyncio.Lock()
+
+    async def send_summary_if_due(self) -> None:
+        candidates = self.stats["candidates"]
+        if candidates == 0 or candidates % self.summary_every != 0:
+            return
+        summary = (
+            "📡 <b>RÉCAP FLUX PUMP.FUN</b>\n"
+            f"Détections reçues : {self.stats['received']}\n"
+            f"Tokens décodés : {candidates}\n"
+            f"Filtres acceptés : {self.stats['passed']}\n"
+            f"Filtres rejetés : {self.stats['rejected']}\n"
+            f"Erreurs de traitement : {self.stats['errors']}\n"
+            f"Mode observation : {'ON' if self.observation_mode else 'OFF'}"
+        )
+        try:
+            await self.notifier.bot.send_message(chat_id=self.notifier.channel_id, text=summary, parse_mode="HTML")
+            logger.info("[SUMMARY] Récapitulatif envoyé après %s tokens décodés", candidates)
+        except TelegramError as exc:
+            logger.error("Erreur Telegram récapitulatif: %s", type(exc).__name__)
 
     async def rpc(self, method: str, params: list[Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -256,14 +279,24 @@ class HeliusMonitor:
             candidate = self.candidate_from_transaction(tx, signature) if tx else None
             if not candidate or not await self.store.claim(candidate["mint"], signature):
                 return
+            self.stats["candidates"] += 1
             data = await self.enrich(candidate)
+            if self.observation_mode:
+                self.stats["passed"] += 1
+                logger.info("[OBSERVATION] Token Pump.fun reçu: %s", candidate["mint"])
+                await self.send_summary_if_due()
+                return
             score, valid, reason = self.engine.evaluate_token(data)
             if valid:
+                self.stats["passed"] += 1
                 logger.info("[FILTER PASSED] %s score=%.2f", candidate["mint"], score)
                 await self.notifier.send_alpha_alert(data, score)
             else:
+                self.stats["rejected"] += 1
                 logger.info("[FILTER REJECTED: %s] %s", reason, candidate["mint"])
+            await self.send_summary_if_due()
         except Exception as exc:
+            self.stats["errors"] += 1
             logger.warning("Erreur de traitement de %s: %s", signature, type(exc).__name__)
 
     async def enqueue(self, signature: str, logs: list[str]) -> None:
@@ -274,6 +307,7 @@ class HeliusMonitor:
                 logger.warning("File d’événements pleine; événement ignoré pour préserver le service")
                 return
             self.enqueued_signatures.add(signature)
+            self.stats["received"] += 1
             await self.event_queue.put((signature, logs))
 
     async def worker(self) -> None:
