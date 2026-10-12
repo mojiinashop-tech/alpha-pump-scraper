@@ -121,8 +121,8 @@ class TelegramNotifier:
         try:
             await self.bot.send_message(chat_id=self.channel_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
             logger.info("Alerte envoyée pour %s", symbol)
-        except TelegramError:
-            logger.exception("Erreur Telegram pour %s", mint)
+        except TelegramError as exc:
+            logger.error("Erreur Telegram pour %s: %s", mint, type(exc).__name__)
 
 
 class SeenStore:
@@ -338,7 +338,7 @@ async def start_health_server() -> web.AppRunner:
 
 async def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    channel = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+    channel = os.getenv("TELEGRAM_CHANNEL_ID", "").strip() or os.getenv("TELEGRAM_CHAT_ID", "").strip()
     runner = await start_health_server()
     if not token or not channel:
         logger.error("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHANNEL_ID manquant")
@@ -346,14 +346,15 @@ async def main():
     store = SeenStore(os.getenv("SEEN_DB_PATH", "data/seen.sqlite3"))
     engine = QuantumAlphaEngine(min_liq=3.0, max_liq=30.0, min_score=80.0)
     notifier = TelegramNotifier(token, channel)
+    monitor: HeliusMonitor | None = None
     try:
         await notifier.bot.send_message(
             chat_id=channel,
             text="💎 <b>QUANTUM ALPHA BOT SÉCURISÉ — PRÊT</b>\n<i>Surveillance Helius active en cours...</i>",
             parse_mode="HTML",
         )
-    except TelegramError:
-        logger.exception("Erreur de notification de démarrage")
+    except TelegramError as exc:
+        logger.error("Erreur de notification de démarrage: %s", type(exc).__name__)
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -361,6 +362,10 @@ async def main():
     try:
         async with aiohttp.ClientSession() as session:
             monitor = HeliusMonitor(session, engine, notifier, store)
+            if not monitor.ws_url or not monitor.rpc_url:
+                logger.error("[CONFIG] Helius absent: alertes désactivées, serveur de santé maintenu")
+                await stop.wait()
+                return
             task = asyncio.create_task(monitor.run())
             await stop.wait()
             monitor.stop_event.set()
