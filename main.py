@@ -156,11 +156,13 @@ class HeliusMonitor:
         self.notifier = notifier
         self.store = store
         self.api_key = os.getenv("HELIUS_API_KEY", "").strip()
-        self.ws_url = os.getenv("HELIUS_WS_URL", "").strip() or (
-            f"wss://mainnet.helius-rpc.com/?api-key={self.api_key}" if self.api_key else ""
-        )
         self.rpc_url = os.getenv("HELIUS_RPC_URL", "").strip() or (
             f"https://mainnet.helius-rpc.com/?api-key={self.api_key}" if self.api_key else ""
+        )
+        configured_ws = os.getenv("HELIUS_WS_URL", "").strip()
+        self.ws_url = configured_ws or (
+            f"wss://mainnet.helius-rpc.com/?api-key={self.api_key}" if self.api_key else
+            self.rpc_url.replace("https://", "wss://", 1) if self.rpc_url.startswith("https://") else ""
         )
         self.stop_event = asyncio.Event()
         self.rpc_workers = max(1, int(os.getenv("RPC_WORKERS", "4")))
