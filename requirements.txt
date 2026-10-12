@@ -1,2 +1,2 @@
+python-telegram-bot>=20.0
 aiohttp>=3.9
-solders>=0.21
