@@ -32,7 +32,7 @@ DEFAULT_COMMITMENT = os.getenv("SOLANA_COMMITMENT", "confirmed")
 class QuantumAlphaEngine:
     """Moteur de scoring conservé, avec filtres durs et rejet par défaut."""
 
-    def __init__(self, min_liq: float = 3.0, max_liq: float = 30.0, max_top10: float = 20.0,
+    def __init__(self, min_liq: float = 1.5, max_liq: float = 30.0, max_top10: float = 20.0,
                  max_dev: float = 5.0, max_bundle: float = 5.0, min_score: float = 80.0):
         self.min_liq = min_liq
         self.max_liq = max_liq
@@ -41,6 +41,9 @@ class QuantumAlphaEngine:
         self.max_bundle = max_bundle
         self.min_score = min_score
         self.require_dex_paid = os.getenv("REQUIRE_DEX_PAID", "true").strip().lower() not in {"0", "false", "no", "off"}
+        self.min_market_cap = float(os.getenv("MIN_MARKET_CAP_USD", "1"))
+        self.max_market_cap = float(os.getenv("MAX_MARKET_CAP_USD", "1000000000"))
+        self.max_block0_buys = int(os.getenv("MAX_BLOCK0_BUYS", "1"))
         self.elite_wallets = {w.strip() for w in os.getenv("ELITE_WALLETS", "").split(",") if w.strip()}
 
     def evaluate_token(self, data: Dict[str, Any]) -> tuple[float, bool, str]:
@@ -54,16 +57,21 @@ class QuantumAlphaEngine:
         dex_paid = bool(data.get("dex_paid", False))
         tax_pct = float(data.get("tax_pct", 0.0) or 0.0)
         early_buyers: List[str] = data.get("early_buyers", []) or []
+        block0_buys = int(data.get("block0_buys", 0) or 0)
 
         if not mint or mint == "Inconnu":
             return 0.0, False, "Mint absent"
         if self.require_dex_paid and not dex_paid:
             return 0.0, False, "DEX non payé (donnée absente ou non vérifiée)"
-        if not (self.min_liq < liq <= self.max_liq):
+        if not (liq >= self.min_liq and liq <= self.max_liq):
             return 0.0, False, f"Liquidité hors zone ({liq:.2f} SOL)"
-        if top10 >= self.max_top10:
+        if mc < self.min_market_cap or mc > self.max_market_cap:
+            return 0.0, False, f"Market Cap hors zone (${mc:,.2f})"
+        if block0_buys > self.max_block0_buys:
+            return 0.0, False, f"Trop d'achats au bloc 0 ({block0_buys})"
+        if top10 > self.max_top10:
             return 0.0, False, f"Top 10 trop élevé ({top10}%)"
-        if dev >= self.max_dev:
+        if dev > self.max_dev:
             return 0.0, False, f"Wallet Dev trop lourd ({dev}%)"
         if bundle > self.max_bundle:
             return 0.0, False, f"Bundlers trop élevés ({bundle}%)"
@@ -119,7 +127,8 @@ class TelegramNotifier:
             f"🔗 <a href='https://dexscreener.com/solana/{mint}'>Dexscreener</a> • "
             f"<a href='https://gmgn.ai/solana/token/{mint}'>GMGN</a> • "
             f"<a href='https://axiom.trade/t/{mint}'>Axiom</a> • "
-            f"<a href='https://pump.fun/coin/{mint}'>Pump.fun</a>"
+            f"<a href='https://pump.fun/coin/{mint}'>Pump.fun</a> • "
+            f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
         )
         try:
             await self.bot.send_message(chat_id=self.channel_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
@@ -173,6 +182,7 @@ class HeliusMonitor:
         self.observation_mode = os.getenv("OBSERVATION_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
         self.summary_every = max(1, int(os.getenv("SUMMARY_EVERY", "25")))
         self.stats = {"received": 0, "candidates": 0, "passed": 0, "rejected": 0, "errors": 0}
+        self.error_log_count = 0
         self.enqueued_signatures: set[str] = set()
         self.enqueue_lock = asyncio.Lock()
 
@@ -235,8 +245,11 @@ class HeliusMonitor:
         return None
 
     @staticmethod
-    def candidate_from_transaction(tx: dict[str, Any], signature: str) -> Optional[Dict[str, Any]]:
+    def candidate_from_transaction(tx: dict[str, Any], signature: str, logs: list[str]) -> Optional[Dict[str, Any]]:
         try:
+            log_text = " ".join(logs).lower()
+            if not any(marker in log_text for marker in ("instruction: create", "instruction: createv2")):
+                return None
             message = tx["transaction"]["message"]
             keys = [item.get("pubkey") if isinstance(item, dict) else item for item in message["accountKeys"]]
             for instruction in message.get("instructions", []):
@@ -276,7 +289,7 @@ class HeliusMonitor:
     async def process(self, signature: str, logs: list[str]) -> None:
         try:
             tx = await self.transaction(signature)
-            candidate = self.candidate_from_transaction(tx, signature) if tx else None
+            candidate = self.candidate_from_transaction(tx, signature, logs) if tx else None
             if not candidate or not await self.store.claim(candidate["mint"], signature):
                 return
             self.stats["candidates"] += 1
@@ -297,7 +310,9 @@ class HeliusMonitor:
             await self.send_summary_if_due()
         except Exception as exc:
             self.stats["errors"] += 1
-            logger.warning("Erreur de traitement de %s: %s", signature, type(exc).__name__)
+            self.error_log_count += 1
+            if self.error_log_count <= 5 or self.error_log_count % 100 == 0:
+                logger.warning("Erreur de traitement #%s (%s): %s", self.error_log_count, type(exc).__name__, signature)
 
     async def enqueue(self, signature: str, logs: list[str]) -> None:
         async with self.enqueue_lock:
@@ -382,7 +397,14 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHANNEL_ID manquant")
         await asyncio.Event().wait()
     store = SeenStore(os.getenv("SEEN_DB_PATH", "data/seen.sqlite3"))
-    engine = QuantumAlphaEngine(min_liq=3.0, max_liq=30.0, min_score=80.0)
+    engine = QuantumAlphaEngine(
+        min_liq=float(os.getenv("MIN_LIQUIDITY_SOL", "1.5")),
+        max_liq=float(os.getenv("MAX_LIQUIDITY_SOL", "30")),
+        max_top10=float(os.getenv("MAX_TOP10_PCT", "20")),
+        max_dev=float(os.getenv("MAX_DEV_PCT", "5")),
+        max_bundle=float(os.getenv("MAX_BUNDLE_PCT", "5")),
+        min_score=float(os.getenv("MIN_SCORE", "80")),
+    )
     notifier = TelegramNotifier(token, channel)
     monitor: HeliusMonitor | None = None
     try:
@@ -400,6 +422,11 @@ async def main():
     try:
         async with aiohttp.ClientSession() as session:
             monitor = HeliusMonitor(session, engine, notifier, store)
+            logger.info(
+                "[CONFIG] Mode observation=%s; DEX payé obligatoire=%s; liquidité=%.2f-%.2f SOL; top10<=%.1f%%; dev<=%.1f%%; bloc0<=%s",
+                monitor.observation_mode, engine.require_dex_paid, engine.min_liq, engine.max_liq,
+                engine.max_top10, engine.max_dev, engine.max_block0_buys,
+            )
             if not monitor.ws_url or not monitor.rpc_url:
                 logger.error("[CONFIG] Helius absent: alertes désactivées, serveur de santé maintenu")
                 await stop.wait()
