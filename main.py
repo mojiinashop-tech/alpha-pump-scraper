@@ -227,6 +227,8 @@ class HeliusMonitor:
                         self.rate_limit_count += 1
                         if self.rate_limit_count <= 3 or self.rate_limit_count % 25 == 0:
                             logger.warning("RPC rate limité #%s pour %s; nouvelle tentative dans %.1fs", self.rate_limit_count, method, wait)
+                        if method == "getTransaction":
+                            return None
                         await asyncio.sleep(wait)
                         continue
                     if response.status >= 400:
