@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 import aiohttp
 from aiohttp import web
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 logging.basicConfig(
@@ -338,11 +338,21 @@ class TelegramNotifier:
             f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
         )
 
+    @staticmethod
+    def action_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+        mint = data["mint"]
+        curve = data["bonding_curve"]
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Acheter / Gérer sur GMGN", url=f"https://gmgn.ai/sol/token/{mint}")],
+            [InlineKeyboardButton("⚡ Acheter / Gérer sur Axiom", url=f"https://axiom.trade/meme/{curve}")],
+        ])
+
     async def send_alert(self, data: dict[str, Any]) -> None:
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id, text=self.format_alert(data),
                 parse_mode="HTML", disable_web_page_preview=True,
+                reply_markup=self.action_keyboard(data),
             )
             logger.info("[TELEGRAM] Alerte envoyée %s", data["mint"])
         except TelegramError as exc:
