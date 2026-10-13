@@ -360,7 +360,7 @@ class TelegramNotifier:
         mint = data["mint"]
         curve = data["bonding_curve"]
         age_ms = data.get("age_ms")
-        age_text = f"{age_ms} ms" if age_ms is not None else "inconnu"
+        age_text = f"+{age_ms / 1000:.2f}s" if age_ms is not None else "inconnu"
         detected_at = data.get("detected_at", "inconnu")
         return (
             "🎯 <b>TOKEN SAIN DÉTECTÉ</b>\n"
@@ -369,7 +369,7 @@ class TelegramNotifier:
             f"👨‍💻 <b>Dev:</b> {data['dev_pct']:.1f}%\n"
             f"👥 <b>Top 10:</b> {data['top10_pct']:.1f}%\n"
             f"📦 <b>Bundle 0:</b> {data['bundle_pct']:.1f}%\n"
-            f"⏱️ <b>Âge:</b> {age_text} depuis le Block 0\n"
+            f"⏱️ <b>Âge / Latence:</b> {age_text} depuis la création\n"
             f"🕒 <b>Détecté à:</b> {detected_at}\n\n"
             f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> · "
             f"<a href='https://gmgn.ai/sol/token/{mint}'>GMGN</a> · "
@@ -385,6 +385,17 @@ class TelegramNotifier:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Acheter / Gérer sur GMGN", url=f"https://gmgn.ai/sol/token/{mint}")],
             [InlineKeyboardButton("⚡ Acheter / Gérer sur Axiom", url=f"https://axiom.trade/meme/{curve}")],
+            [InlineKeyboardButton("⏸️ PAUSE", callback_data="bot_pause"),
+             InlineKeyboardButton("▶️ REPRENDRE", callback_data="bot_resume"),
+             InlineKeyboardButton("📊 STATUS", callback_data="bot_status")],
+        ])
+
+    @staticmethod
+    def control_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏸️ PAUSE", callback_data="bot_pause"),
+             InlineKeyboardButton("▶️ REPRENDRE", callback_data="bot_resume"),
+             InlineKeyboardButton("📊 STATUS", callback_data="bot_status")],
         ])
 
     async def send_alert(self, data: dict[str, Any]) -> None:
@@ -398,9 +409,10 @@ class TelegramNotifier:
         except TelegramError as exc:
             logger.error("Telegram indisponible pour %s: %s", data["mint"], type(exc).__name__)
 
-    async def send_text(self, chat_id: int | str, text: str) -> None:
+    async def send_text(self, chat_id: int | str, text: str,
+                        reply_markup: InlineKeyboardMarkup | None = None) -> None:
         try:
-            await self.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            await self.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
         except TelegramError as exc:
             logger.warning("Réponse Telegram impossible: %s", type(exc).__name__)
 
@@ -544,14 +556,14 @@ class TelegramCommandPoller:
         self.stop = asyncio.Event()
         self.offset: int | None = None
 
-    async def status(self, chat_id: int | str) -> None:
+    async def status_text(self) -> str:
         wallet = os.getenv("WALLET_ADDRESS", "").strip()
         try:
             balance = await self.monitor.rpc.wallet_balance_sol(wallet) if wallet else None
         except RpcError:
             balance = None
         balance_text = f"{balance:.4f} SOL" if balance is not None else "non configuré"
-        text = (
+        return (
             "📡 <b>STATUS BOT</b>\n"
             f"Tokens suivis : {self.monitor.stats['tracked']}\n"
             f"Tokens validés : {self.monitor.stats['valid']}\n"
@@ -562,9 +574,63 @@ class TelegramCommandPoller:
             f"Surveillance : {'PAUSE' if self.monitor.paused else 'ACTIVE'}\n"
             "Mode observation : OFF"
         )
-        await self.notifier.send_text(chat_id, text)
+
+    async def status(self, chat_id: int | str) -> None:
+        await self.notifier.send_text(
+            chat_id, await self.status_text(),
+            reply_markup=self.notifier.control_keyboard(),
+        )
+
+    def authorized(self, chat_id: int | str, chat_type: str) -> bool:
+        return str(chat_id) == self.chat_id or chat_type == "private"
+
+    def admin_allowed(self, user_id: Any, chat_type: str) -> bool:
+        return not (chat_type == "private" and self.admin_user_ids
+                    and str(user_id) not in self.admin_user_ids)
+
+    async def handle_callback(self, update: Any) -> None:
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        chat_type = getattr(chat, "type", "")
+        if chat_id is None or not self.authorized(chat_id, chat_type):
+            await self.notifier.bot.answer_callback_query(query.id, text="Accès refusé", show_alert=True)
+            return
+        data = getattr(query, "data", "")
+        user_id = getattr(getattr(query, "from_user", None), "id", None)
+        if data in {"bot_pause", "bot_resume"} and not self.admin_allowed(user_id, chat_type):
+            await self.notifier.bot.answer_callback_query(query.id, text="Commande réservée à l’administrateur", show_alert=True)
+            return
+        if data == "bot_pause":
+            self.monitor.paused = True
+            confirmation = "Surveillance en pause"
+        elif data == "bot_resume":
+            self.monitor.paused = False
+            confirmation = "Surveillance reprise"
+        elif data == "bot_status":
+            confirmation = "Statut actualisé"
+        else:
+            await self.notifier.bot.answer_callback_query(query.id)
+            return
+        await self.notifier.bot.answer_callback_query(query.id, text=confirmation)
+        try:
+            await self.notifier.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message.message_id,
+                text=await self.status_text(),
+                parse_mode="HTML",
+                reply_markup=self.notifier.control_keyboard(),
+            )
+        except TelegramError as exc:
+            logger.warning("Mise à jour du statut impossible: %s", type(exc).__name__)
 
     async def handle(self, update: Any) -> None:
+        if getattr(update, "callback_query", None) is not None:
+            await self.handle_callback(update)
+            return
         message = getattr(update, "message", None) or getattr(update, "channel_post", None)
         if message is None or not getattr(message, "text", None):
             return
@@ -583,6 +649,7 @@ class TelegramCommandPoller:
                 "💎 <b>Bot Pump.fun actif</b>\n"
                 "Je surveille les nouveaux tokens Pump.fun et je valide leurs métriques directement on-chain.\n\n"
                 "Commandes : /status · /pause · /resume",
+                reply_markup=self.notifier.control_keyboard(),
             )
         elif command == "/status":
             await self.status(source_chat)
@@ -592,17 +659,17 @@ class TelegramCommandPoller:
                 await self.notifier.send_text(source_chat, "⛔ Commande réservée à l’administrateur du bot.")
                 return
             self.monitor.paused = True
-            await self.notifier.send_text(source_chat, "⏸️ <b>Bot en pause.</b>\nLe flux reste connecté, aucune alerte ne sera publiée.")
+            await self.notifier.send_text(source_chat, "⏸️ <b>Bot en pause.</b>\nLe flux reste connecté, aucune alerte ne sera publiée.", reply_markup=self.notifier.control_keyboard())
         elif command == "/resume":
             user = getattr(getattr(message, "from_user", None), "id", None)
             if is_private and self.admin_user_ids and str(user) not in self.admin_user_ids:
                 await self.notifier.send_text(source_chat, "⛔ Commande réservée à l’administrateur du bot.")
                 return
             self.monitor.paused = False
-            await self.notifier.send_text(source_chat, "▶️ <b>Bot réactivé.</b>\nLa validation on-chain reprend.")
+            await self.notifier.send_text(source_chat, "▶️ <b>Bot réactivé.</b>\nLa validation on-chain reprend.", reply_markup=self.notifier.control_keyboard())
 
     async def run(self) -> None:
-        logger.info("[TELEGRAM] Polling actif: /start /status /pause /resume; DM et canal autorisés")
+        logger.info("[TELEGRAM] Polling actif: commandes + boutons pause/reprise/status; DM et canal autorisés")
         try:
             await self.notifier.bot.delete_webhook(drop_pending_updates=False)
         except TelegramError as exc:
@@ -612,7 +679,7 @@ class TelegramCommandPoller:
                 updates = await asyncio.wait_for(
                     self.notifier.bot.get_updates(
                         offset=self.offset, timeout=25,
-                        allowed_updates=["message", "channel_post"],
+                        allowed_updates=["message", "channel_post", "callback_query"],
                     ), timeout=35,
                 )
                 for update in updates:
@@ -677,7 +744,12 @@ async def main() -> None:
             monitor_task = asyncio.create_task(monitor.run())
             poll_task = asyncio.create_task(TelegramCommandPoller(notifier, monitor, chat_id).run())
             try:
-                await asyncio.wait_for(notifier.bot.send_message(chat_id=chat_id, text="💎 <b>BOT PUMPFUN ON-CHAIN — PRÊT</b>\n<i>Polling Telegram actif, observation OFF.</i>", parse_mode="HTML"), timeout=10)
+                await asyncio.wait_for(notifier.bot.send_message(
+                    chat_id=chat_id,
+                    text="💎 <b>BOT PUMPFUN ON-CHAIN — PRÊT</b>\n<i>Polling Telegram actif, observation OFF.</i>",
+                    parse_mode="HTML",
+                    reply_markup=notifier.control_keyboard(),
+                ), timeout=10)
             except (TelegramError, asyncio.TimeoutError) as exc:
                 logger.warning("Message Telegram de démarrage ignoré: %s", type(exc).__name__)
             await stop.wait()
