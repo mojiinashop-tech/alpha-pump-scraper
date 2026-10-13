@@ -12,6 +12,7 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aiohttp
@@ -358,13 +359,18 @@ class TelegramNotifier:
     def format_alert(data: dict[str, Any]) -> str:
         mint = data["mint"]
         curve = data["bonding_curve"]
+        age_ms = data.get("age_ms")
+        age_text = f"{age_ms} ms" if age_ms is not None else "inconnu"
+        detected_at = data.get("detected_at", "inconnu")
         return (
             "🎯 <b>TOKEN SAIN DÉTECTÉ</b>\n"
             f"<code>{mint}</code>\n\n"
             f"💧 <b>Liq:</b> {data['liquidity_sol']:.2f} SOL\n"
             f"👨‍💻 <b>Dev:</b> {data['dev_pct']:.1f}%\n"
             f"👥 <b>Top 10:</b> {data['top10_pct']:.1f}%\n"
-            f"📦 <b>Bundle 0:</b> {data['bundle_pct']:.1f}%\n\n"
+            f"📦 <b>Bundle 0:</b> {data['bundle_pct']:.1f}%\n"
+            f"⏱️ <b>Âge:</b> {age_text} depuis le Block 0\n"
+            f"🕒 <b>Détecté à:</b> {detected_at}\n\n"
             f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> · "
             f"<a href='https://gmgn.ai/sol/token/{mint}'>GMGN</a> · "
             f"<a href='https://axiom.trade/meme/{curve}'>Axiom</a>\n"
@@ -453,6 +459,13 @@ class Monitor:
             data = await self.validator.validate(candidate)
             if not data:
                 return
+            detected_at_ms = time.time_ns() // 1_000_000
+            block_time = tx.get("blockTime")
+            creation_at_ms = int(float(block_time) * 1000) if block_time is not None else None
+            data["age_ms"] = max(0, detected_at_ms - creation_at_ms) if creation_at_ms is not None else None
+            data["detected_at"] = datetime.fromtimestamp(
+                detected_at_ms / 1000, tz=timezone.utc
+            ).strftime("%H:%M:%S.%f")[:-3]
             self.stats["valid"] += 1
             logger.info("[FILTER PASSED] %s — validation on-chain complète", candidate.mint)
             await self.notifier.send_alert(data)
