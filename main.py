@@ -459,6 +459,10 @@ class Monitor:
                             if value.get("err") or not value.get("signature"):
                                 continue
                             await self.enqueue(value["signature"], value.get("logs", []))
+                        if not self.stop.is_set():
+                            logger.warning("[HELIUS] Connexion WebSocket fermée; reconnexion dans %.1fs", delay)
+                            await asyncio.sleep(delay)
+                            delay = min(30.0, delay * 2)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -477,6 +481,9 @@ class TelegramCommandPoller:
     def __init__(self, notifier: TelegramNotifier, monitor: Monitor, chat_id: str):
         self.notifier, self.monitor = notifier, monitor
         self.chat_id = str(chat_id)
+        self.admin_user_ids = {
+            item.strip() for item in os.getenv("TELEGRAM_ADMIN_USER_IDS", "").split(",") if item.strip()
+        }
         self.stop = asyncio.Event()
         self.offset: int | None = None
 
@@ -506,21 +513,39 @@ class TelegramCommandPoller:
             return
         chat = getattr(message, "chat", None)
         source_chat = getattr(chat, "id", None)
-        if source_chat is None or str(source_chat) != self.chat_id:
+        chat_type = getattr(chat, "type", "")
+        is_configured_chat = source_chat is not None and str(source_chat) == self.chat_id
+        is_private = chat_type == "private"
+        if source_chat is None or not (is_configured_chat or is_private):
             return
         command = message.text.strip().split()[0].split("@")[0].lower()
         logger.info("[TELEGRAM] Commande reçue: %s", command)
-        if command == "/status":
+        if command == "/start":
+            await self.notifier.send_text(
+                source_chat,
+                "💎 <b>Bot Pump.fun actif</b>\n"
+                "Je surveille les nouveaux tokens Pump.fun et je valide leurs métriques directement on-chain.\n\n"
+                "Commandes : /status · /pause · /resume",
+            )
+        elif command == "/status":
             await self.status(source_chat)
         elif command == "/pause":
+            user = getattr(getattr(message, "from_user", None), "id", None)
+            if is_private and self.admin_user_ids and str(user) not in self.admin_user_ids:
+                await self.notifier.send_text(source_chat, "⛔ Commande réservée à l’administrateur du bot.")
+                return
             self.monitor.paused = True
             await self.notifier.send_text(source_chat, "⏸️ <b>Bot en pause.</b>\nLe flux reste connecté, aucune alerte ne sera publiée.")
         elif command == "/resume":
+            user = getattr(getattr(message, "from_user", None), "id", None)
+            if is_private and self.admin_user_ids and str(user) not in self.admin_user_ids:
+                await self.notifier.send_text(source_chat, "⛔ Commande réservée à l’administrateur du bot.")
+                return
             self.monitor.paused = False
             await self.notifier.send_text(source_chat, "▶️ <b>Bot réactivé.</b>\nLa validation on-chain reprend.")
 
     async def run(self) -> None:
-        logger.info("[TELEGRAM] Polling actif: /status /pause /resume")
+        logger.info("[TELEGRAM] Polling actif: /start /status /pause /resume; DM et canal autorisés")
         try:
             await self.notifier.bot.delete_webhook(drop_pending_updates=False)
         except TelegramError as exc:
