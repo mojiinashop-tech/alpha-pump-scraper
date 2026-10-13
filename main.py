@@ -48,6 +48,10 @@ class QuantumAlphaEngine:
 
     def evaluate_token(self, data: Dict[str, Any]) -> tuple[float, bool, str]:
         mint = data.get("mint", "Inconnu")
+        required_metrics = ("dex_paid", "liquidity_sol", "market_cap_usd", "top10_pct", "dev_pct", "bundle_pct", "block0_buys", "age_minutes")
+        missing = [key for key in required_metrics if key not in data or data.get(key) is None]
+        if missing:
+            return 0.0, False, f"Métriques absentes: {','.join(missing)}"
         liq = float(data.get("liquidity_sol", 0.0) or 0.0)
         mc = float(data.get("market_cap_usd", 0.0) or 0.0)
         top10 = float(data.get("top10_pct", 0.0) or 0.0)
