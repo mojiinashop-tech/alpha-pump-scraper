@@ -176,6 +176,10 @@ class HeliusMonitor:
         )
         self.stop_event = asyncio.Event()
         self.rpc_workers = max(1, int(os.getenv("RPC_WORKERS", "4")))
+        self.rpc_min_interval = max(0.0, float(os.getenv("RPC_MIN_INTERVAL", "0.15")))
+        self.rpc_lock = asyncio.Lock()
+        self.last_rpc_at = 0.0
+        self.rate_limit_count = 0
         self.event_queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(
             maxsize=max(10, int(os.getenv("EVENT_QUEUE_SIZE", "500")))
         )
@@ -209,11 +213,20 @@ class HeliusMonitor:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         for attempt in range(4):
             try:
-                async with self.session.post(self.rpc_url, json=payload, timeout=10) as response:
+                async with self.rpc_lock:
+                    loop = asyncio.get_running_loop()
+                    wait = self.rpc_min_interval - (loop.time() - self.last_rpc_at)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self.last_rpc_at = loop.time()
+                    response_context = self.session.post(self.rpc_url, json=payload, timeout=10)
+                async with response_context as response:
                     if response.status == 429:
                         retry_after = response.headers.get("Retry-After")
                         wait = float(retry_after) if retry_after else min(4.0, 0.5 * (2 ** attempt))
-                        logger.warning("RPC rate limité pour %s; nouvelle tentative dans %.1fs", method, wait)
+                        self.rate_limit_count += 1
+                        if self.rate_limit_count <= 3 or self.rate_limit_count % 25 == 0:
+                            logger.warning("RPC rate limité #%s pour %s; nouvelle tentative dans %.1fs", self.rate_limit_count, method, wait)
                         await asyncio.sleep(wait)
                         continue
                     if response.status >= 400:
