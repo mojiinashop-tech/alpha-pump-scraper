@@ -309,8 +309,8 @@ class Validator:
         checks: list[dict[str, Any]] = []
         holders = sorted((int(x.get("amount", 0)) for x in largest if x.get("address") != candidate.associated_curve), reverse=True)
         single_pct = (holders[0] / denominator * 100) if holders else 100.0
-        checks.append({"name": "single_holder", "passed": single_pct <= self.cfg["max_single_holder"], "value": f"{single_pct:.2f}%", "limit": f"<={self.cfg['max_single_holder']:.2f}%"})
-        if single_pct > self.cfg["max_single_holder"]:
+        checks.append({"name": "single_holder", "passed": single_pct < self.cfg["max_single_holder"], "value": f"{single_pct:.2f}%", "limit": f"<{self.cfg['max_single_holder']:.2f}%"})
+        if single_pct >= self.cfg["max_single_holder"]:
             self.reject(candidate, f"holder unique {single_pct:.2f}% > {self.cfg['max_single_holder']:.2f}%")
             return None
 
@@ -361,8 +361,8 @@ class Validator:
             return None
 
         dex_liquidity = await self.dex_liquidity_usd(candidate.mint)
-        dex_ok = dex_liquidity is not None and dex_liquidity >= self.cfg["min_dex_liquidity_usd"]
-        checks.append({"name": "dex_liquidity_usd", "passed": dex_ok, "value": f"${dex_liquidity:,.0f}" if dex_liquidity is not None else "indisponible", "limit": f">=${self.cfg['min_dex_liquidity_usd']:,.0f}"})
+        dex_ok = dex_liquidity is not None and dex_liquidity > self.cfg["min_dex_liquidity_usd"]
+        checks.append({"name": "dex_liquidity_usd", "passed": dex_ok, "value": f"${dex_liquidity:,.0f}" if dex_liquidity is not None else "indisponible", "limit": f">${self.cfg['min_dex_liquidity_usd']:,.0f}"})
         if not dex_ok:
             self.reject(candidate, f"liquidité DEX ${dex_liquidity or 0:,.0f} < ${self.cfg['min_dex_liquidity_usd']:,.0f}")
             return None
@@ -469,7 +469,7 @@ class Validator:
                           if x.get("address") != candidate.associated_curve), reverse=True)
         top10_pct = sum(holders[:10]) / denominator * 100
         dev_pct = dev_raw / denominator * 100
-        if top10_pct > self.cfg["max_top10"]:
+        if top10_pct >= self.cfg["max_top10"]:
             self.reject(candidate, f"Top 10 {top10_pct:.2f}% > {self.cfg['max_top10']:.2f}%")
             return None
         if dev_pct > self.cfg["max_dev"]:
