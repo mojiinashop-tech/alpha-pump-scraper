@@ -488,6 +488,23 @@ class TelegramNotifier:
             logger.info("[TELEGRAM] Alerte envoyée %s", data["mint"])
         except TelegramError as exc:
             logger.error("Telegram indisponible pour %s: %s", data["mint"], type(exc).__name__)
+    async def send_discovery(self, mint: str, source: str, details: str = "") -> None:
+        """Discovery-only alert: never represents an on-chain validation or an auto-buy signal."""
+        text = (
+            "🔎 <b>DÉCOUVERTE MARCHÉ — DRY RUN</b>\n"
+            f"<code>{mint}</code>\n\n"
+            f"Source: <b>{source}</b>\n"
+            f"{details}\n\n"
+            "⚠️ Non validé par les filtres on-chain; aucune transaction automatique.\n"
+            f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> · "
+            f"<a href='https://pump.fun/coin/{mint}'>Pump.fun</a> · "
+            f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
+        )
+        try:
+            await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=self.control_keyboard())
+            logger.info("[DISCOVERY] Alerte %s via %s", mint, source)
+        except TelegramError as exc:
+            logger.warning("Découverte Telegram impossible pour %s: %s", mint, type(exc).__name__)
 
     async def send_text(self, chat_id: int | str, text: str,
                         reply_markup: InlineKeyboardMarkup | None = None) -> None:
@@ -541,6 +558,68 @@ class SeenStore:
     def close(self) -> None:
         self.db.close()
 
+class MultiSourceDiscovery:
+    """Public-market discovery only; it never bypasses the safe transaction boundary."""
+    def __init__(self, session: aiohttp.ClientSession, notifier: TelegramNotifier, store: SeenStore, monitor: "Monitor"):
+        self.session, self.notifier, self.store, self.monitor = session, notifier, store, monitor
+        self.stop = asyncio.Event()
+        self.interval = max(10, int(os.getenv("DISCOVERY_INTERVAL_SECONDS", "15")))
+        self.dex_urls = [
+            os.getenv("DEXSCREENER_PROFILES_URL", "https://api.dexscreener.com/token-profiles/latest/v1"),
+            os.getenv("DEXSCREENER_BOOSTS_URL", "https://api.dexscreener.com/token-boosts/latest/v1"),
+        ]
+        self.raydium_url = os.getenv("RAYDIUM_POOLS_URL", "https://api-v3.raydium.io/main/pairs?page=1&pageSize=100&sort=volume24h&order=desc")
+
+    @staticmethod
+    def _mints(payload: Any) -> list[tuple[str, str, str]]:
+        rows = payload if isinstance(payload, list) else (payload or {}).get("data", []) if isinstance(payload, dict) else []
+        if isinstance(rows, dict):
+            rows = rows.get("data", [])
+        found: list[tuple[str, str, str]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            base_token = row.get("baseToken") if isinstance(row.get("baseToken"), dict) else {}
+            mint = row.get("tokenAddress") or row.get("mint") or row.get("baseMint") or base_token.get("address")
+            if isinstance(mint, str) and len(mint) >= 32:
+                found.append((mint, str(row.get("source") or "market"), str(row.get("volume24h") or row.get("volume", ""))))
+        return found
+
+    async def _get_json(self, url: str) -> Any:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with self.session.get(url, timeout=timeout, headers={"Accept": "application/json"}) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            return await response.json(content_type=None)
+
+    async def run(self) -> None:
+        if not env_bool("ENABLE_MULTI_SOURCE", True):
+            logger.info("[DISCOVERY] Multi-source désactivé")
+            return
+        logger.info("[DISCOVERY] DexScreener + Raydium actifs; intervalle=%ss", self.interval)
+        while not self.stop.is_set():
+            try:
+                candidates: list[tuple[str, str, str]] = []
+                for url in self.dex_urls:
+                    try:
+                        candidates.extend((mint, "DexScreener", detail) for mint, _, detail in self._mints(await self._get_json(url)))
+                    except Exception as exc:
+                        logger.debug("[DISCOVERY] DexScreener indisponible: %s", type(exc).__name__)
+                try:
+                    candidates.extend((mint, "Raydium", detail) for mint, _, detail in self._mints(await self._get_json(self.raydium_url)))
+                except Exception as exc:
+                    logger.debug("[DISCOVERY] Raydium indisponible: %s", type(exc).__name__)
+                for mint, source, detail in candidates:
+                    if await self.store.claim(f"discovery:{mint}", source):
+                        self.monitor.stats["discovered"] += 1
+                        await self.notifier.send_discovery(mint, source, f"Volume observé: {detail}" if detail else "Activité de marché détectée")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[DISCOVERY] cycle interrompu: %s", type(exc).__name__)
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop.wait(), timeout=self.interval)
+
 
 class Monitor:
     def __init__(self, session: aiohttp.ClientSession, rpc: SolanaRPC,
@@ -557,7 +636,7 @@ class Monitor:
         self.queue_lock = asyncio.Lock()
         self.workers_count = max(1, int(os.getenv("RPC_WORKERS", "1")))
         self.error_count = 0
-        self.stats = {"tracked": 0, "valid": 0, "rejected": 0, "errors": 0}
+        self.stats = {"tracked": 0, "valid": 0, "rejected": 0, "discovered": 0, "errors": 0}
         self.validator = Validator(cfg, rpc, self)
 
     async def process(self, signature: str, logs: list[str]) -> None:
@@ -814,7 +893,7 @@ async def health(request: web.Request) -> web.Response:
     monitor = request.app.get("monitor")
     payload = {"status": "ok", "service": "pumpfun-onchain", "observation_mode": False}
     if monitor:
-        payload.update({"tracked": monitor.stats["tracked"], "valid": monitor.stats["valid"], "rejected": monitor.stats["rejected"], "paused": monitor.paused})
+        payload.update({"tracked": monitor.stats["tracked"], "valid": monitor.stats["valid"], "rejected": monitor.stats["rejected"], "discovered": monitor.stats["discovered"], "paused": monitor.paused})
     return web.json_response(payload)
 
 
@@ -870,6 +949,8 @@ async def main() -> None:
                 loop.add_signal_handler(sig, stop.set)
             monitor_task = asyncio.create_task(monitor.run())
             poll_task = asyncio.create_task(TelegramCommandPoller(notifier, monitor, chat_id).run())
+            discovery = MultiSourceDiscovery(session, notifier, store, monitor)
+            discovery_task = asyncio.create_task(discovery.run())
             try:
                 await asyncio.wait_for(notifier.bot.send_message(
                     chat_id=chat_id,
@@ -881,12 +962,16 @@ async def main() -> None:
                 logger.warning("Message Telegram de démarrage ignoré: %s", type(exc).__name__)
             await stop.wait()
             monitor.stop.set()
+            discovery.stop.set()
             monitor_task.cancel()
             poll_task.cancel()
+            discovery_task.cancel()
             with suppress(asyncio.CancelledError):
                 await monitor_task
             with suppress(asyncio.CancelledError):
                 await poll_task
+            with suppress(asyncio.CancelledError):
+                await discovery_task
     finally:
         store.close()
         await runner.cleanup()
