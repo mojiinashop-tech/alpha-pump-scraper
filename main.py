@@ -390,6 +390,7 @@ class Monitor:
         self.enqueued: set[str] = set()
         self.lock = asyncio.Lock()
         self.workers_count = max(1, int(os.getenv("RPC_WORKERS", "1")))
+        self.error_count = 0
 
     async def process(self, signature: str, logs: list[str]) -> None:
         try:
@@ -414,7 +415,9 @@ class Monitor:
             score = 100.0
             await self.notifier.send(data, score)
         except (RpcError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("Traitement ignoré (%s): %s", type(exc).__name__, signature)
+            self.error_count += 1
+            if self.error_count <= 5 or self.error_count % 100 == 0:
+                logger.warning("Traitement ignoré #%s (%s): %s", self.error_count, str(exc)[:180], signature)
 
     async def worker(self) -> None:
         while not self.stop.is_set():
