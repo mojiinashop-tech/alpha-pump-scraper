@@ -41,6 +41,40 @@ def env_bool(name: str, default: bool) -> bool:
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+@dataclass(frozen=True)
+class AutoBuyConfig:
+    """Configuration lue depuis Render; l’exécution d’ordres reste désactivée."""
+
+    enabled_requested: bool
+    amount_sol: float
+    private_key_configured: bool
+
+    @classmethod
+    def from_env(cls) -> "AutoBuyConfig":
+        try:
+            amount = float(os.getenv("BUY_AMOUNT_SOL", "0"))
+        except ValueError:
+            amount = 0.0
+        return cls(
+            enabled_requested=env_bool("ENABLE_AUTO_BUY", False),
+            amount_sol=max(0.0, amount),
+            private_key_configured=bool(os.getenv("PRIVATE_KEY", "").strip()),
+        )
+
+
+class AutoBuyExecutor:
+    """Garde-fou: aucun ordre, signature ou transfert n’est exécuté par ce bot."""
+
+    def __init__(self, config: AutoBuyConfig):
+        self.config = config
+
+    async def execute(self, token: dict[str, Any]) -> None:
+        raise RuntimeError(
+            "Auto-buy bloqué: ce service ne signe ni ne transmet de transaction. "
+            "Utiliser les boutons GMGN/Axiom pour une exécution manuelle."
+        )
+
+
 class RpcError(RuntimeError):
     pass
 
@@ -602,6 +636,12 @@ async def main() -> None:
         "bundle_slot_window": int(os.getenv("BUNDLE_SLOT_WINDOW", "0")),
         "require_mint_renounced": env_bool("REQUIRE_MINT_RENOUNCED", True),
     }
+    auto_buy_config = AutoBuyConfig.from_env()
+    auto_buy = AutoBuyExecutor(auto_buy_config)
+    if auto_buy_config.enabled_requested:
+        logger.warning("[AUTO-BUY] ENABLE_AUTO_BUY demandé mais bloqué: aucune transaction automatique n’est exécutée")
+    else:
+        logger.info("[AUTO-BUY] désactivé; boutons GMGN/Axiom disponibles pour exécution manuelle")
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
