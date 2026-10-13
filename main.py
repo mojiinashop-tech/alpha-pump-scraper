@@ -383,6 +383,8 @@ class Monitor:
         self.session, self.rpc, self.validator = session, rpc, validator
         self.dex, self.notifier, self.store = dex, notifier, store
         self.ws_url = os.getenv("HELIUS_WS_URL", "").strip()
+        if not self.ws_url and rpc.url.startswith("https://"):
+            self.ws_url = rpc.url.replace("https://", "wss://", 1)
         self.stop = asyncio.Event()
         self.queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(maxsize=500)
         self.enqueued: set[str] = set()
