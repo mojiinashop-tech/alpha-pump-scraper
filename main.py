@@ -504,13 +504,23 @@ async def main() -> None:
             validator = Validator(cfg, rpc)
             notifier = TelegramNotifier(token, chat_id)
             monitor = Monitor(session, rpc, validator, DexScreener(session), notifier, store)
-            await notifier.bot.send_message(chat_id=chat_id, text="💎 <b>QUANTUM ALPHA BOT — MODE DIRECT PRÊT</b>\n<i>Validation on-chain active, observation OFF.</i>", parse_mode="HTML")
             logger.info("Configuration stricte active: liquidité %.2f-%.2f SOL; MC minimum $%.0f; DEX payé obligatoire", cfg["min_liquidity"], cfg["max_liquidity"], float(os.getenv("MIN_MARKET_CAP_USD", "5000")))
             loop = asyncio.get_running_loop()
             stop = asyncio.Event()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, stop.set)
             task = asyncio.create_task(monitor.run())
+            try:
+                await asyncio.wait_for(
+                    notifier.bot.send_message(
+                        chat_id=chat_id,
+                        text="💎 <b>QUANTUM ALPHA BOT — MODE DIRECT PRÊT</b>\n<i>Validation on-chain active, observation OFF.</i>",
+                        parse_mode="HTML",
+                    ),
+                    timeout=10,
+                )
+            except (TelegramError, asyncio.TimeoutError) as exc:
+                logger.warning("Notification Telegram de démarrage ignorée: %s", type(exc).__name__)
             await stop.wait()
             monitor.stop.set()
             task.cancel()
