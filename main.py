@@ -116,7 +116,7 @@ class SolanaRPC:
     async def transaction(self, signature: str) -> Optional[dict[str, Any]]:
         return await self.call("getTransaction", [signature, {
             "encoding": "jsonParsed", "commitment": COMMITMENT,
-            "maxSupportedTransactionVersion": 0,
+            "maxSupportedTransactionVersion": 1,
         }])
 
 
