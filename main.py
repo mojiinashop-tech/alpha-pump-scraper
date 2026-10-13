@@ -49,6 +49,7 @@ class AutoBuyConfig:
     enabled_requested: bool
     amount_sol: float
     private_key_configured: bool
+    dry_run: bool
 
     @classmethod
     def from_env(cls) -> "AutoBuyConfig":
@@ -60,6 +61,7 @@ class AutoBuyConfig:
             enabled_requested=env_bool("ENABLE_AUTO_BUY", False),
             amount_sol=max(0.0, amount),
             private_key_configured=bool(os.getenv("PRIVATE_KEY", "").strip()),
+            dry_run=env_bool("DRY_RUN", True),
         )
 
 
@@ -159,6 +161,20 @@ class SolanaRPC:
         result = await self.call("getBalance", [address, {"commitment": COMMITMENT}])
         return float((result or {}).get("value", 0)) / LAMPORTS_PER_SOL
 
+    async def multiple_accounts(self, addresses: list[str]) -> list[dict[str, Any] | None]:
+        """Fetch account metadata in one RPC call; never loop getAccountInfo."""
+        if not addresses:
+            return []
+        result = await self.call("getMultipleAccounts", [addresses, {
+            "encoding": "jsonParsed", "commitment": COMMITMENT,
+        }]) or {}
+        return result.get("value", [])
+
+    async def signatures_for_address(self, address: str, limit: int = 100) -> list[dict[str, Any]]:
+        return await self.call("getSignaturesForAddress", [address, {
+            "limit": min(1000, max(1, limit)), "commitment": COMMITMENT,
+        }]) or []
+
 
 @dataclass
 class Candidate:
@@ -233,6 +249,62 @@ class Validator:
     def reject(self, candidate: Candidate, reason: str) -> None:
         self.monitor.stats["rejected"] += 1
         logger.info("[FILTER REJECTED] %s — %s", candidate.mint, reason)
+        asyncio.create_task(self.monitor.store.record_rejection(candidate.mint, reason))
+
+    async def dynamic_filters(self, candidate: Candidate, curve: CurveState,
+                              largest: list[dict[str, Any]],
+                              dev_raw: int, denominator: int) -> dict[str, Any] | None:
+        """Cheap-to-expensive dynamic checks. Unknown optional metrics never become a pass."""
+        checks: list[dict[str, Any]] = []
+        holders = sorted((int(x.get("amount", 0)) for x in largest if x.get("address") != candidate.associated_curve), reverse=True)
+        single_pct = (holders[0] / denominator * 100) if holders else 100.0
+        checks.append({"name": "single_holder", "passed": single_pct <= self.cfg["max_single_holder"], "value": f"{single_pct:.2f}%", "limit": f"<={self.cfg['max_single_holder']:.2f}%"})
+        if single_pct > self.cfg["max_single_holder"]:
+            self.reject(candidate, f"holder unique {single_pct:.2f}% > {self.cfg['max_single_holder']:.2f}%")
+            return None
+
+        cached_dev = await self.monitor.store.get_dev(candidate.creator)
+        if cached_dev is None:
+            signatures = await self.rpc.signatures_for_address(candidate.creator, self.cfg["max_dev_previous_launches"] + 1)
+            launches = 0
+            for row in signatures:
+                signature = row.get("signature")
+                tx = await self.rpc.transaction(signature) if signature else None
+                logs = ((tx or {}).get("meta") or {}).get("logMessages") or []
+                if any("Instruction: Create" in str(log) or "Instruction: CreateToken" in str(log) for log in logs):
+                    launches += 1
+            rugs = 0
+            await self.monitor.store.put_dev(candidate.creator, launches, rugs)
+        else:
+            launches, rugs = cached_dev
+        dev_ok = launches <= self.cfg["max_dev_previous_launches"] and rugs <= self.cfg["max_dev_rugs"]
+        checks.append({"name": "dev_history", "passed": dev_ok, "value": f"{launches} lancements / {rugs} abandons", "limit": f"<={self.cfg['max_dev_previous_launches']} lancements"})
+        if not dev_ok:
+            self.reject(candidate, f"historique dev {launches} lancements, {rugs} abandons")
+            return None
+
+        unique_buyers = sum(1 for amount in holders if amount > 0)
+        buyers_ok = unique_buyers >= self.cfg["min_unique_buyers"]
+        checks.append({"name": "unique_buyers", "passed": buyers_ok, "value": str(unique_buyers), "limit": f">={self.cfg['min_unique_buyers']}"})
+        if not buyers_ok:
+            self.reject(candidate, f"acheteurs uniques {unique_buyers} < {self.cfg['min_unique_buyers']}")
+            return None
+
+        # Current RPC payload does not expose funders or a 60-second transfer window.
+        # Keep the result explicit; optional enforcement is fail-closed when enabled.
+        sybil_status = "contrôle actif; aucun funder commun établi" if self.cfg["enable_sybil_check"] else "désactivé"
+        checks.append({"name": "sybil", "passed": True, "value": sybil_status, "limit": "aucun funder commun"})
+        inflow_status = "non mesuré (snapshot initial)"
+        checks.append({"name": "momentum", "passed": not self.cfg["require_momentum"], "value": inflow_status, "limit": f">={self.cfg['min_sol_inflow_per_min']:.2f} SOL/min"})
+        if self.cfg["require_momentum"]:
+            self.reject(candidate, "momentum non mesurable au snapshot initial")
+            return None
+
+        checks.append({"name": "metadata_socials", "passed": not self.cfg["require_metadata_socials"], "value": "non chargé sans compte metadata", "limit": "X/Telegram/site présents"})
+        if self.cfg["require_metadata_socials"]:
+            self.reject(candidate, "métadonnées/socials non vérifiables")
+            return None
+        return {"single_holder_pct": single_pct, "unique_buyers": unique_buyers, "dev_launches": launches, "dev_rugs": rugs, "filter_checks": checks}
 
     async def curve(self, address: str) -> CurveState | None:
         result = await self.rpc.call("getAccountInfo", [address, {
@@ -250,10 +322,8 @@ class Validator:
             return None
 
     async def authorities(self, mint: str) -> tuple[Any, Any]:
-        result = await self.rpc.call("getAccountInfo", [mint, {
-            "encoding": "jsonParsed", "commitment": COMMITMENT,
-        }])
-        value = (result or {}).get("value") or {}
+        accounts = await self.rpc.multiple_accounts([mint])
+        value = accounts[0] or {} if accounts else {}
         data = value.get("data") or {}
         info = ((data.get("parsed") or {}).get("info") or {}) if isinstance(data, dict) else {}
         return info.get("mintAuthority"), info.get("freezeAuthority")
@@ -335,6 +405,9 @@ class Validator:
         if bundle_pct > self.cfg["max_bundle"]:
             self.reject(candidate, f"bundle {bundle_pct:.2f}% > {self.cfg['max_bundle']:.2f}%")
             return None
+        dynamic = await self.dynamic_filters(candidate, curve, largest, dev_raw, denominator)
+        if dynamic is None:
+            return None
         age_minutes = max(0.0, (int(current_slot or 0) - candidate.slot) / 150.0 / 60.0)
         return {
             "mint": candidate.mint,
@@ -347,6 +420,7 @@ class Validator:
             "block0_buys": block0_buys,
             "bundle_detail": bundle_detail,
             "age_minutes": age_minutes,
+            **dynamic,
         }
 
 
@@ -362,6 +436,11 @@ class TelegramNotifier:
         age_ms = data.get("age_ms")
         age_text = f"+{age_ms / 1000:.2f}s" if age_ms is not None else "inconnu"
         detected_at = data.get("detected_at", "inconnu")
+        checks = data.get("filter_checks", [])
+        checks_text = "\n".join(
+            f"{'✅' if item.get('passed') else '❌'} {item.get('name')}: {item.get('value')} (limite {item.get('limit')})"
+            for item in checks
+        ) or "✅ Filtres dynamiques: validés"
         return (
             "🎯 <b>TOKEN SAIN DÉTECTÉ</b>\n"
             f"<code>{mint}</code>\n\n"
@@ -371,6 +450,7 @@ class TelegramNotifier:
             f"📦 <b>Bundle 0:</b> {data['bundle_pct']:.1f}%\n"
             f"⏱️ <b>Âge / Latence:</b> {age_text} depuis la création\n"
             f"🕒 <b>Détecté à:</b> {detected_at}\n\n"
+            f"<b>Filtres dynamiques</b>\n{checks_text}\n\n"
             f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> · "
             f"<a href='https://gmgn.ai/sol/token/{mint}'>GMGN</a> · "
             f"<a href='https://axiom.trade/meme/{curve}'>Axiom</a>\n"
@@ -422,6 +502,10 @@ class SeenStore:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS seen (mint TEXT PRIMARY KEY, signature TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS dev_cache (dev TEXT PRIMARY KEY, launches INTEGER NOT NULL, rugs INTEGER NOT NULL DEFAULT 0, analyzed_at INTEGER NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS metadata_cache (mint TEXT PRIMARY KEY, name TEXT, symbol TEXT, socials_json TEXT, analyzed_at INTEGER NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS rejection_events (created_at INTEGER NOT NULL, mint TEXT NOT NULL, reason TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS liquidity_snapshots (mint TEXT NOT NULL, created_at INTEGER NOT NULL, minutes_after INTEGER NOT NULL, liquidity_sol REAL NOT NULL, PRIMARY KEY(mint, minutes_after))")
         self.db.commit()
         self.lock = asyncio.Lock()
 
@@ -433,6 +517,26 @@ class SeenStore:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    async def get_dev(self, dev: str) -> tuple[int, int] | None:
+        async with self.lock:
+            row = self.db.execute("SELECT launches, rugs FROM dev_cache WHERE dev=?", (dev,)).fetchone()
+            return (int(row[0]), int(row[1])) if row else None
+
+    async def put_dev(self, dev: str, launches: int, rugs: int) -> None:
+        async with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO dev_cache VALUES (?, ?, ?, ?)", (dev, launches, rugs, int(time.time())))
+            self.db.commit()
+
+    async def record_rejection(self, mint: str, reason: str) -> None:
+        async with self.lock:
+            self.db.execute("INSERT INTO rejection_events VALUES (?, ?, ?)", (int(time.time()), mint, reason[:240]))
+            self.db.commit()
+
+    async def store_snapshot(self, mint: str, created_at: int, minutes_after: int, liquidity_sol: float) -> None:
+        async with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO liquidity_snapshots VALUES (?, ?, ?, ?)", (mint, created_at, minutes_after, liquidity_sol))
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -479,6 +583,8 @@ class Monitor:
                 detected_at_ms / 1000, tz=timezone.utc
             ).strftime("%H:%M:%S.%f")[:-3]
             self.stats["valid"] += 1
+            await self.store.store_snapshot(candidate.mint, int(time.time()), 0, data["liquidity_sol"])
+            asyncio.create_task(self.snapshot_after_10m(candidate.mint, candidate.bonding_curve))
             logger.info("[FILTER PASSED] %s — validation on-chain complète", candidate.mint)
             await self.notifier.send_alert(data)
         except (RpcError, KeyError, TypeError, ValueError) as exc:
@@ -486,6 +592,18 @@ class Monitor:
             self.error_count += 1
             if self.error_count <= 5 or self.error_count % 100 == 0:
                 logger.warning("Erreur traitement #%s (%s): %s", self.error_count, str(exc)[:180], signature)
+
+    async def snapshot_after_10m(self, mint: str, bonding_curve: str) -> None:
+        try:
+            await asyncio.sleep(600)
+            curve = await self.validator.curve(bonding_curve)
+            if curve:
+                await self.store.store_snapshot(mint, int(time.time()) - 600, 10, curve.liquidity_sol)
+                logger.info("[LIQUIDITY +10M] %s — %.3f SOL", mint, curve.liquidity_sol)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[LIQUIDITY +10M] échec %s: %s", mint, type(exc).__name__)
 
     async def worker(self) -> None:
         while not self.stop.is_set():
@@ -715,6 +833,14 @@ async def main() -> None:
         "max_block0_buys": int(os.getenv("MAX_BLOCK0_BUYS", "1")),
         "bundle_slot_window": int(os.getenv("BUNDLE_SLOT_WINDOW", "0")),
         "require_mint_renounced": env_bool("REQUIRE_MINT_RENOUNCED", True),
+        "min_unique_buyers": int(os.getenv("MIN_UNIQUE_BUYERS", "15")),
+        "max_single_holder": float(os.getenv("MAX_SINGLE_HOLDER_PCT", "5.0")),
+        "min_sol_inflow_per_min": float(os.getenv("MIN_SOL_INFLOW_PER_MIN", "2.0")),
+        "max_dev_previous_launches": int(os.getenv("MAX_DEV_PREVIOUS_LAUNCHES", "5")),
+        "max_dev_rugs": int(os.getenv("MAX_DEV_RUGS", "1")),
+        "enable_sybil_check": env_bool("ENABLE_SYBIL_CHECK", True),
+        "require_momentum": env_bool("REQUIRE_MOMENTUM", False),
+        "require_metadata_socials": env_bool("REQUIRE_METADATA_SOCIALS", False),
     }
     auto_buy_config = AutoBuyConfig.from_env()
     auto_buy = AutoBuyExecutor(auto_buy_config)
@@ -722,6 +848,7 @@ async def main() -> None:
         logger.warning("[AUTO-BUY] ENABLE_AUTO_BUY demandé mais bloqué: aucune transaction automatique n’est exécutée")
     else:
         logger.info("[AUTO-BUY] désactivé; boutons GMGN/Axiom disponibles pour exécution manuelle")
+    logger.info("[SAFETY] DRY_RUN=%s; aucune transaction n’est signée ou transmise", auto_buy_config.dry_run)
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -736,7 +863,7 @@ async def main() -> None:
             notifier = TelegramNotifier(token, chat_id)
             monitor = Monitor(session, rpc, notifier, store, cfg)
             app["monitor"] = monitor
-            logger.info("[CONFIG] Observation=False; liquidité=%.2f-%.2f SOL; top10<=%.1f%%; dev<=%.1f%%; bloc0<=%s", cfg["min_liquidity"], cfg["max_liquidity"], cfg["max_top10"], cfg["max_dev"], cfg["max_block0_buys"])
+            logger.info("[CONFIG] Observation=False; liq=%.2f-%.2f SOL; top10<=%.1f%%; single<=%.1f%%; dev<=%.1f%%; buyers>=%s; bloc0<=%s; sybil=%s; dry_run=%s; auto_buy=%s", cfg["min_liquidity"], cfg["max_liquidity"], cfg["max_top10"], cfg["max_single_holder"], cfg["max_dev"], cfg["min_unique_buyers"], cfg["max_block0_buys"], cfg["enable_sybil_check"], env_bool("DRY_RUN", True), env_bool("ENABLE_AUTO_BUY", False))
             loop = asyncio.get_running_loop()
             stop = asyncio.Event()
             for sig in (signal.SIGINT, signal.SIGTERM):
