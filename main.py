@@ -538,10 +538,9 @@ class TelegramNotifier:
     @staticmethod
     def action_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
         mint = data["mint"]
-        curve = data["bonding_curve"]
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Acheter / Gérer sur GMGN", url=f"https://gmgn.ai/sol/token/{mint}")],
-            [InlineKeyboardButton("⚡ Acheter / Gérer sur Axiom", url=f"https://axiom.trade/meme/{curve}")],
+            [InlineKeyboardButton("⚡ Acheter / Gérer sur Axiom", url=f"https://axiom.trade/token/{mint}")],
             [InlineKeyboardButton("⏸️ PAUSE", callback_data="bot_pause"),
              InlineKeyboardButton("▶️ REPRENDRE", callback_data="bot_resume"),
              InlineKeyboardButton("📊 STATUS", callback_data="bot_status")],
