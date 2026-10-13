@@ -263,16 +263,23 @@ class Validator:
         return len(early), percentage, f"{len(early)} achat(s), {percentage:.2f}% supply"
 
     async def validate(self, candidate: Candidate) -> dict[str, Any] | None:
+        def reject(reason: str) -> None:
+            logger.info("[FILTER REJECTED] %s — %s", candidate.mint, reason)
+
         curve = await self.curve(candidate.bonding_curve)
         if not curve or curve.complete or curve.real_token_reserves <= 0:
+            reject("bonding curve absente, complète ou réserves invalides")
             return None
         liquidity = curve.liquidity_sol
         if not (self.cfg["min_liquidity"] <= liquidity <= self.cfg["max_liquidity"]):
+            reject(f"liquidité {liquidity:.2f} SOL hors plage")
             return None
         mint_auth, freeze_auth = await self.mint_authorities(candidate.mint)
         if self.cfg["require_mint_renounced"] and mint_auth is not None:
+            reject("mint authority active")
             return None
         if freeze_auth is not None:
+            reject("freeze authority active")
             return None
         largest, dev_raw, slot = await asyncio.gather(
             self.largest_accounts(candidate.mint),
@@ -284,10 +291,18 @@ class Validator:
         holders = sorted((int(x.get("amount", 0)) for x in largest if x.get("address") != candidate.associated_curve), reverse=True)
         top10_pct = sum(holders[:10]) / denominator * 100
         dev_pct = dev_raw / denominator * 100
-        if top10_pct > self.cfg["max_top10"] or dev_pct > self.cfg["max_dev"]:
+        if top10_pct > self.cfg["max_top10"]:
+            reject(f"Top 10 {top10_pct:.2f}% > {self.cfg['max_top10']:.2f}%")
+            return None
+        if dev_pct > self.cfg["max_dev"]:
+            reject(f"Dev {dev_pct:.2f}% > {self.cfg['max_dev']:.2f}%")
             return None
         block0_buys, bundle_pct, bundle_detail = await self.bundles(candidate)
-        if block0_buys > self.cfg["max_block0_buys"] or bundle_pct > self.cfg["max_bundle"]:
+        if block0_buys > self.cfg["max_block0_buys"]:
+            reject(f"{block0_buys} achats bloc 0 > {self.cfg['max_block0_buys']}")
+            return None
+        if bundle_pct > self.cfg["max_bundle"]:
+            reject(f"bundle {bundle_pct:.2f}% > {self.cfg['max_bundle']:.2f}%")
             return None
         age_minutes = max(0.0, (slot - candidate.slot) / 150.0 / 60.0)
         return {
@@ -356,6 +371,76 @@ class TelegramNotifier:
             logger.error("Telegram indisponible: %s", type(exc).__name__)
 
 
+class TelegramCommandPoller:
+    """Long polling Bot API pour les commandes envoyées au canal privé."""
+
+    def __init__(self, notifier: TelegramNotifier, monitor: "Monitor", chat_id: str):
+        self.notifier = notifier
+        self.monitor = monitor
+        self.chat_id = str(chat_id)
+        self.stop = asyncio.Event()
+        self.offset: int | None = None
+
+    async def reply(self, chat_id: int | str, text: str) -> None:
+        try:
+            await self.notifier.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as exc:
+            logger.warning("Réponse Telegram impossible: %s", type(exc).__name__)
+
+    def status_text(self) -> str:
+        return (
+            "📡 <b>STATUS BOT</b>\n"
+            f"WebSocket Helius : {'actif' if not self.monitor.stop.is_set() else 'arrêté'}\n"
+            f"Mode observation : OFF\n"
+            f"Surveillance : {'PAUSE' if self.monitor.paused else 'ACTIVE'}\n"
+            f"File d’événements : {self.monitor.queue.qsize()}\n"
+            f"Erreurs RPC : {self.monitor.error_count}\n"
+            f"Rate limits RPC : {self.monitor.rpc.rate_limits}"
+        )
+
+    async def handle(self, update: Any) -> None:
+        message = getattr(update, "message", None) or getattr(update, "channel_post", None)
+        if message is None or not getattr(message, "text", None):
+            return
+        source_chat = getattr(getattr(message, "chat", None), "id", None)
+        if source_chat is None or str(source_chat) != self.chat_id:
+            return
+        command = message.text.strip().split()[0].split("@")[0].lower()
+        if command == "/status":
+            await self.reply(source_chat, self.status_text())
+        elif command == "/pause":
+            self.monitor.paused = True
+            logger.info("[COMMAND] /pause reçu depuis Telegram")
+            await self.reply(source_chat, "⏸️ <b>Surveillance en pause.</b>\nLe WebSocket reste connecté, aucune alerte ne sera publiée.")
+        elif command == "/resume":
+            self.monitor.paused = False
+            logger.info("[COMMAND] /resume reçu depuis Telegram")
+            await self.reply(source_chat, "▶️ <b>Surveillance reprise.</b>\nLes validations on-chain sont actives.")
+
+    async def run(self) -> None:
+        try:
+            await self.notifier.bot.delete_webhook(drop_pending_updates=False)
+        except TelegramError as exc:
+            logger.warning("Webhook Telegram non supprimé: %s", type(exc).__name__)
+        while not self.stop.is_set():
+            try:
+                updates = await asyncio.wait_for(
+                    self.notifier.bot.get_updates(
+                        offset=self.offset, timeout=25,
+                        allowed_updates=["message", "channel_post"],
+                    ),
+                    timeout=35,
+                )
+                for update in updates:
+                    self.offset = update.update_id + 1
+                    await self.handle(update)
+            except asyncio.CancelledError:
+                raise
+            except (TelegramError, asyncio.TimeoutError) as exc:
+                logger.warning("Polling Telegram en attente (%s)", type(exc).__name__)
+                await asyncio.sleep(2)
+
+
 class SeenStore:
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -391,6 +476,7 @@ class Monitor:
         self.lock = asyncio.Lock()
         self.workers_count = max(1, int(os.getenv("RPC_WORKERS", "1")))
         self.error_count = 0
+        self.paused = False
 
     async def process(self, signature: str, logs: list[str]) -> None:
         try:
@@ -400,9 +486,11 @@ class Monitor:
             candidate = parse_candidate(tx, signature, logs)
             if not candidate or not await self.store.claim(candidate.mint, signature):
                 return
+            if self.paused:
+                logger.info("[PAUSED] Token ignoré pendant la pause: %s", candidate.mint)
+                return
             data = await self.validator.validate(candidate)
             if not data:
-                logger.info("[FILTER REJECTED] %s — validation on-chain", candidate.mint)
                 return
             data = await self.dex.enrich(data)
             if not data:
@@ -515,6 +603,8 @@ async def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, stop.set)
             task = asyncio.create_task(monitor.run())
+            command_poller = TelegramCommandPoller(notifier, monitor, chat_id)
+            command_task = asyncio.create_task(command_poller.run())
             try:
                 await asyncio.wait_for(
                     notifier.bot.send_message(
@@ -528,9 +618,13 @@ async def main() -> None:
                 logger.warning("Notification Telegram de démarrage ignorée: %s", type(exc).__name__)
             await stop.wait()
             monitor.stop.set()
+            command_poller.stop.set()
             task.cancel()
+            command_task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            with suppress(asyncio.CancelledError):
+                await command_task
     finally:
         store.close()
         await runner.cleanup()
