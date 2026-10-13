@@ -33,6 +33,7 @@ for name in ("telegram", "httpx", "httpcore"):
 LAMPORTS_PER_SOL = 1_000_000_000
 TOKEN_DECIMALS = 6
 TOTAL_SUPPLY_RAW = 1_000_000_000 * 10**TOKEN_DECIMALS
+PUMP_INITIAL_REAL_TOKEN_RESERVES = 793_100_000 * 10**TOKEN_DECIMALS
 PUMP_PROGRAM_ID = os.getenv("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 COMMITMENT = os.getenv("SOLANA_COMMITMENT", "confirmed")
 
@@ -251,6 +252,56 @@ class Validator:
         logger.info("[FILTER REJECTED] %s — %s", candidate.mint, reason)
         asyncio.create_task(self.monitor.store.record_rejection(candidate.mint, reason))
 
+    async def market_metrics(self, candidate: Candidate) -> dict[str, Any] | None:
+        """Infer distinct traders from signed curve transactions, not holder count."""
+        rows = await self.rpc.signatures_for_address(candidate.bonding_curve, 100)
+        buyers: set[str] = set()
+        sellers: set[str] = set()
+        positive_sol = 0
+        activity_slots: list[int] = []
+        for row in rows:
+            slot = int(row.get("slot", -1))
+            if row.get("err") or slot < candidate.slot or slot > candidate.slot + int(self.cfg["activity_slot_window"]):
+                continue
+            signature = row.get("signature")
+            if not signature or signature == candidate.signature:
+                continue
+            tx = await self.rpc.transaction(signature)
+            if not tx:
+                continue
+            message = ((tx.get("transaction") or {}).get("message") or {})
+            signer = next((key.get("pubkey") for key in message.get("accountKeys", [])
+                           if isinstance(key, dict) and key.get("signer")), None)
+            if not signer:
+                continue
+            keys = [key.get("pubkey") if isinstance(key, dict) else key for key in message.get("accountKeys", [])]
+            try:
+                curve_index = keys.index(candidate.bonding_curve)
+                meta = tx.get("meta") or {}
+                delta = meta.get("postBalances", [])[curve_index] - meta.get("preBalances", [])[curve_index]
+            except (ValueError, IndexError, TypeError, KeyError):
+                continue
+            if delta > 0:
+                buyers.add(signer)
+                positive_sol += delta
+            elif delta < 0:
+                sellers.add(signer)
+            activity_slots.append(slot)
+        elapsed_minutes = max(1 / 60, ((max(activity_slots) - min(activity_slots)) / 150 / 60) if activity_slots else 1 / 60)
+        return {"buyers": len(buyers), "sellers": len(sellers), "buyer_seller_ratio": len(buyers) / max(1, len(sellers)), "sol_inflow_per_min": positive_sol / LAMPORTS_PER_SOL / elapsed_minutes, "buyer_wallets": buyers}
+
+    async def dex_liquidity_usd(self, mint: str) -> float | None:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        try:
+            async with self.monitor.session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json(content_type=None)
+            values = [float((pair.get("liquidity") or {}).get("usd", 0) or 0) for pair in (payload.get("pairs") or []) if pair.get("chainId") == "solana"]
+            return max(values, default=0.0)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TypeError, ValueError):
+            return None
+
     async def dynamic_filters(self, candidate: Candidate, curve: CurveState,
                               largest: list[dict[str, Any]],
                               dev_raw: int, denominator: int) -> dict[str, Any] | None:
@@ -283,11 +334,37 @@ class Validator:
             self.reject(candidate, f"historique dev {launches} lancements, {rugs} abandons")
             return None
 
-        unique_buyers = sum(1 for amount in holders if amount > 0)
+        metrics = await self.market_metrics(candidate)
+        if metrics is None:
+            self.reject(candidate, "activité acheteurs/vendeurs non mesurable")
+            return None
+        unique_buyers = int(metrics["buyers"])
         buyers_ok = unique_buyers >= self.cfg["min_unique_buyers"]
         checks.append({"name": "unique_buyers", "passed": buyers_ok, "value": str(unique_buyers), "limit": f">={self.cfg['min_unique_buyers']}"})
         if not buyers_ok:
             self.reject(candidate, f"acheteurs uniques {unique_buyers} < {self.cfg['min_unique_buyers']}")
+            return None
+
+        ratio = float(metrics["buyer_seller_ratio"])
+        ratio_ok = ratio > self.cfg["min_buyer_seller_ratio"]
+        checks.append({"name": "buyers_sellers", "passed": ratio_ok, "value": f"{ratio:.2f}", "limit": f">{self.cfg['min_buyer_seller_ratio']:.2f}"})
+        if not ratio_ok:
+            self.reject(candidate, f"ratio acheteurs/vendeurs {ratio:.2f} <= {self.cfg['min_buyer_seller_ratio']:.2f}")
+            return None
+
+        curve_progress = max(0.0, min(100.0, (PUMP_INITIAL_REAL_TOKEN_RESERVES - curve.real_token_reserves) / PUMP_INITIAL_REAL_TOKEN_RESERVES * 100))
+        inflow = float(metrics["sol_inflow_per_min"])
+        momentum_ok = curve_progress > self.cfg["min_curve_progress_pct"] or inflow >= self.cfg["min_sol_inflow_per_min"]
+        checks.append({"name": "curve_or_inflow", "passed": momentum_ok, "value": f"curve {curve_progress:.2f}% / inflow {inflow:.3f} SOL/min", "limit": f">{self.cfg['min_curve_progress_pct']:.1f}% ou >={self.cfg['min_sol_inflow_per_min']:.3f} SOL/min"})
+        if not momentum_ok:
+            self.reject(candidate, f"progression curve {curve_progress:.2f}% et inflow {inflow:.3f} SOL/min insuffisants")
+            return None
+
+        dex_liquidity = await self.dex_liquidity_usd(candidate.mint)
+        dex_ok = dex_liquidity is not None and dex_liquidity >= self.cfg["min_dex_liquidity_usd"]
+        checks.append({"name": "dex_liquidity_usd", "passed": dex_ok, "value": f"${dex_liquidity:,.0f}" if dex_liquidity is not None else "indisponible", "limit": f">=${self.cfg['min_dex_liquidity_usd']:,.0f}"})
+        if not dex_ok:
+            self.reject(candidate, f"liquidité DEX ${dex_liquidity or 0:,.0f} < ${self.cfg['min_dex_liquidity_usd']:,.0f}")
             return None
 
         # Current RPC payload does not expose funders or a 60-second transfer window.
@@ -304,7 +381,7 @@ class Validator:
         if self.cfg["require_metadata_socials"]:
             self.reject(candidate, "métadonnées/socials non vérifiables")
             return None
-        return {"single_holder_pct": single_pct, "unique_buyers": unique_buyers, "dev_launches": launches, "dev_rugs": rugs, "filter_checks": checks}
+        return {"single_holder_pct": single_pct, "unique_buyers": unique_buyers, "buyers": unique_buyers, "sellers": metrics["sellers"], "buyer_seller_ratio": ratio, "curve_progress_pct": curve_progress, "sol_inflow_per_min": inflow, "dex_liquidity_usd": dex_liquidity, "dev_launches": launches, "dev_rugs": rugs, "filter_checks": checks}
 
     async def curve(self, address: str) -> CurveState | None:
         result = await self.rpc.call("getAccountInfo", [address, {
@@ -906,7 +983,7 @@ async def main() -> None:
     cfg = {
         "min_liquidity": float(os.getenv("MIN_LIQUIDITY_SOL", "1.5")),
         "max_liquidity": float(os.getenv("MAX_LIQUIDITY_SOL", "30")),
-        "max_top10": float(os.getenv("MAX_TOP10_PCT", "20")),
+        "max_top10": float(os.getenv("MAX_TOP10_PCT", "18.0")),
         "max_dev": float(os.getenv("MAX_DEV_PCT", "5")),
         "max_bundle": float(os.getenv("MAX_BUNDLE_PCT", "5")),
         "max_block0_buys": int(os.getenv("MAX_BLOCK0_BUYS", "1")),
@@ -914,7 +991,11 @@ async def main() -> None:
         "require_mint_renounced": env_bool("REQUIRE_MINT_RENOUNCED", True),
         "min_unique_buyers": int(os.getenv("MIN_UNIQUE_BUYERS", "3")),
         "max_single_holder": float(os.getenv("MAX_SINGLE_HOLDER_PCT", "15.0")),
-        "min_sol_inflow_per_min": float(os.getenv("MIN_SOL_INFLOW_PER_MIN", "0.1")),
+        "min_sol_inflow_per_min": float(os.getenv("MIN_SOL_INFLOW_PER_MIN", "0.3")),
+        "min_buyer_seller_ratio": float(os.getenv("MIN_BUYER_SELLER_RATIO", "2.0")),
+        "min_curve_progress_pct": float(os.getenv("MIN_CURVE_PROGRESS_PCT", "10.0")),
+        "min_dex_liquidity_usd": float(os.getenv("MIN_DEX_LIQUIDITY_USD", "4000")),
+        "activity_slot_window": int(os.getenv("ACTIVITY_SLOT_WINDOW", "150")),
         "max_dev_previous_launches": int(os.getenv("MAX_DEV_PREVIOUS_LAUNCHES", "10")),
         "max_dev_rugs": int(os.getenv("MAX_DEV_RUGS", "1")),
         "enable_sybil_check": env_bool("ENABLE_SYBIL_CHECK", True),
