@@ -406,6 +406,7 @@ class TelegramCommandPoller:
         if source_chat is None or str(source_chat) != self.chat_id:
             return
         command = message.text.strip().split()[0].split("@")[0].lower()
+        logger.info("[COMMAND] %s reçu dans le chat autorisé", command)
         if command == "/status":
             await self.reply(source_chat, self.status_text())
         elif command == "/pause":
@@ -418,10 +419,12 @@ class TelegramCommandPoller:
             await self.reply(source_chat, "▶️ <b>Surveillance reprise.</b>\nLes validations on-chain sont actives.")
 
     async def run(self) -> None:
+        logger.info("[TELEGRAM] Polling des commandes démarré")
         try:
             await self.notifier.bot.delete_webhook(drop_pending_updates=False)
         except TelegramError as exc:
             logger.warning("Webhook Telegram non supprimé: %s", type(exc).__name__)
+        logger.info("[TELEGRAM] Polling actif pour /status, /pause et /resume")
         while not self.stop.is_set():
             try:
                 updates = await asyncio.wait_for(
