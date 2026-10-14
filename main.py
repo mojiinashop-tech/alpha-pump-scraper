@@ -36,11 +36,17 @@ TOTAL_SUPPLY_RAW = 1_000_000_000 * 10**TOKEN_DECIMALS
 PUMP_INITIAL_REAL_TOKEN_RESERVES = 793_100_000 * 10**TOKEN_DECIMALS
 PUMP_PROGRAM_ID = os.getenv("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 COMMITMENT = os.getenv("SOLANA_COMMITMENT", "confirmed")
-
-
-def env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
+MIN_LIQUIDITY_SOL = 0.5
+MIN_MARKET_CAP_USD = 1_000.0
+MIN_UNIQUE_BUYERS = 2
+MAX_SINGLE_HOLDER_PCT = 15.0
+ENABLE_SYBIL_CHECK = True
+BLOCK_WINDOW = 3
+SOL_PRICE_USD = 150.0
+MAX_TOP10_PCT = 18.0
+MAX_DEV_PCT = 5.0
+MAX_DEV_PREVIOUS_LAUNCHES = 8
+DRY_RUN = True
 
 
 @dataclass(frozen=True)
@@ -371,6 +377,7 @@ class TelegramNotifier:
 
     async def send_alert(self, data: dict[str, Any]) -> None:
         try:
+            print(f"[TELEGRAM] Envoi alerte mint={data['mint']}", flush=True)
             await self.bot.send_message(
                 chat_id=self.chat_id, text=self.format_alert(data), parse_mode="HTML",
                 disable_web_page_preview=True, reply_markup=self.trade_keyboard(data["mint"]),
@@ -398,6 +405,7 @@ class Monitor:
             if not candidate or not await self.store.claim(candidate.mint, signature):
                 return
             self.stats["tracked"] += 1
+            print(f"[DETECTION] Token Pump.fun mint={candidate.mint} slot={candidate.slot}", flush=True)
             if self.paused:
                 return
             data = await self.validator.validate(candidate, tx or {})
@@ -473,23 +481,22 @@ async def main() -> None:
     if not rpc_url or not telegram_token or not chat_id:
         raise RuntimeError("HELIUS_RPC_URL, TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID sont obligatoires")
     cfg = {
-        "min_liquidity": float(os.getenv("MIN_LIQUIDITY_SOL", "1.5")),
-        "min_market_cap_usd": float(os.getenv("MIN_MARKET_CAP_USD", "4000")),
-        "sol_price_usd": float(os.getenv("SOL_PRICE_USD", "150")),
-        "min_unique_buyers": int(os.getenv("MIN_UNIQUE_BUYERS", "3")),
-        "max_single_holder": float(os.getenv("MAX_SINGLE_HOLDER_PCT", "15.0")),
-        "max_top10_pct": float(os.getenv("MAX_TOP10_PCT", "18.0")),
-        "max_dev_pct": float(os.getenv("MAX_DEV_PCT", "5")),
-        "max_dev_previous_launches": int(os.getenv("MAX_DEV_PREVIOUS_LAUNCHES", "8")),
-        "max_dev_launches": int(os.getenv("MAX_DEV_PREVIOUS_LAUNCHES", "8")),
-        "enable_sybil_check": env_bool("ENABLE_SYBIL_CHECK", True),
-        "block_window": int(os.getenv("BLOCK_WINDOW", "3")),
+        "min_liquidity": MIN_LIQUIDITY_SOL,
+        "min_market_cap_usd": MIN_MARKET_CAP_USD,
+        "sol_price_usd": SOL_PRICE_USD,
+        "min_unique_buyers": MIN_UNIQUE_BUYERS,
+        "max_single_holder": MAX_SINGLE_HOLDER_PCT,
+        "max_top10_pct": MAX_TOP10_PCT,
+        "max_dev_pct": MAX_DEV_PCT,
+        "max_dev_previous_launches": MAX_DEV_PREVIOUS_LAUNCHES,
+        "max_dev_launches": MAX_DEV_PREVIOUS_LAUNCHES,
+        "enable_sybil_check": ENABLE_SYBIL_CHECK,
+        "block_window": BLOCK_WINDOW,
     }
-    dry_run = env_bool("DRY_RUN", True)
-    if not dry_run:
+    if not DRY_RUN:
         raise RuntimeError("DRY_RUN=false est interdit dans cette architecture d’alerte-only")
     logger.info("[SAFETY] DRY_RUN=True; aucune transaction signée ou transmise")
-    logger.info("[CONFIG] source=Pump.fun; liq>=%.2f SOL; MC>= $%.0f; buyers>=%s; single<%.1f%%; dev_launches<=%s; sybil=%s; momentum_required=%s", cfg["min_liquidity"], cfg["min_market_cap_usd"], cfg["min_unique_buyers"], cfg["max_single_holder"], cfg["max_dev_previous_launches"], cfg["enable_sybil_check"], env_bool("REQUIRE_MOMENTUM", False))
+    logger.info("[CONFIG] source=Pump.fun; liq>=%.2f SOL; MC>= $%.0f; buyers>=%s; single<%.1f%%; dev_launches<=%s; sybil=%s; dry_run=%s", cfg["min_liquidity"], cfg["min_market_cap_usd"], cfg["min_unique_buyers"], cfg["max_single_holder"], cfg["max_dev_previous_launches"], cfg["enable_sybil_check"], DRY_RUN)
 
     app = web.Application()
     app.router.add_get("/", health)
