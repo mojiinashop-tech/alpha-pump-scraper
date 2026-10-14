@@ -22,7 +22,7 @@ from telegram.error import TelegramError
 
 logging.basicConfig(
     stream=sys.stdout,
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -34,19 +34,19 @@ LAMPORTS_PER_SOL = 1_000_000_000
 TOKEN_DECIMALS = 6
 TOTAL_SUPPLY_RAW = 1_000_000_000 * 10**TOKEN_DECIMALS
 PUMP_INITIAL_REAL_TOKEN_RESERVES = 793_100_000 * 10**TOKEN_DECIMALS
-PUMP_PROGRAM_ID = os.getenv("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-COMMITMENT = os.getenv("SOLANA_COMMITMENT", "confirmed")
-MIN_LIQUIDITY_SOL = 0.5
-MIN_MARKET_CAP_USD = 1_000.0
-MIN_UNIQUE_BUYERS = 2
-MAX_SINGLE_HOLDER_PCT = 15.0
-ENABLE_SYBIL_CHECK = True
-BLOCK_WINDOW = 3
+PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+COMMITMENT = "confirmed"
+MIN_LIQUIDITY_SOL = float(os.getenv("MIN_LIQUIDITY_SOL", "0.5"))
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "300.0"))
+MIN_UNIQUE_BUYERS = int(os.getenv("MIN_UNIQUE_BUYERS", "1"))
+MAX_SINGLE_HOLDER_PCT = float(os.getenv("MAX_SINGLE_HOLDER_PCT", "25.0"))
+ENABLE_SYBIL_CHECK = os.getenv("ENABLE_SYBIL_CHECK", "true").strip().lower() == "true"
+BLOCK_WINDOW = int(os.getenv("BLOCK_WINDOW", "3"))
 SOL_PRICE_USD = 150.0
-MAX_TOP10_PCT = 18.0
-MAX_DEV_PCT = 5.0
-MAX_DEV_PREVIOUS_LAUNCHES = 8
-DRY_RUN = True
+MAX_TOP10_PCT = float(os.getenv("MAX_TOP10_PCT", "40.0"))
+MAX_DEV_PCT = float(os.getenv("MAX_DEV_PCT", "15.0"))
+MAX_DEV_PREVIOUS_LAUNCHES = int(os.getenv("MAX_DEV_PREVIOUS_LAUNCHES", "15"))
+DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
 
 @dataclass(frozen=True)
@@ -102,9 +102,9 @@ class SolanaRPC:
         self.session = session
         self.url = url
         self.request_id = 0
-        self.limiter = RateLimiter(float(os.getenv("RPC_MAX_RPS", "3")))
-        self.semaphore = asyncio.Semaphore(max(1, int(os.getenv("RPC_CONCURRENCY", "2"))))
-        self.timeout = aiohttp.ClientTimeout(total=float(os.getenv("RPC_TIMEOUT_SECONDS", "12")))
+        self.limiter = RateLimiter(3.0)
+        self.semaphore = asyncio.Semaphore(2)
+        self.timeout = aiohttp.ClientTimeout(total=12)
 
     async def call(self, method: str, params: list[Any], retries: int = 3) -> Any:
         backoff = 0.8
@@ -390,7 +390,7 @@ class TelegramNotifier:
 class Monitor:
     def __init__(self, session: aiohttp.ClientSession, rpc: SolanaRPC, notifier: TelegramNotifier, store: SeenStore, cfg: dict[str, Any]):
         self.session, self.rpc, self.notifier, self.store, self.cfg = session, rpc, notifier, store, cfg
-        self.ws_url = os.getenv("HELIUS_WS_URL", "").strip() or rpc.url.replace("https://", "wss://", 1)
+        self.ws_url = rpc.url.replace("https://", "wss://", 1)
         self.stop = asyncio.Event()
         self.queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(maxsize=500)
         self.enqueued: set[str] = set()
@@ -434,7 +434,7 @@ class Monitor:
         await self.queue.put((signature, logs))
 
     async def run(self) -> None:
-        workers = [asyncio.create_task(self.worker()) for _ in range(max(1, int(os.getenv("RPC_WORKERS", "2"))))]
+        workers = [asyncio.create_task(self.worker()) for _ in range(2)]
         delay = 1.0
         try:
             while not self.stop.is_set():
@@ -477,7 +477,7 @@ async def health(request: web.Request) -> web.Response:
 async def main() -> None:
     rpc_url = os.getenv("HELIUS_RPC_URL", "").strip()
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip() or os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not rpc_url or not telegram_token or not chat_id:
         raise RuntimeError("HELIUS_RPC_URL, TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID sont obligatoires")
     cfg = {
@@ -504,7 +504,7 @@ async def main() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
-    store = SeenStore(os.getenv("SEEN_DB_PATH", "data/seen.sqlite3"))
+    store = SeenStore("data/seen.sqlite3")
     stop = asyncio.Event()
     try:
         async with aiohttp.ClientSession() as session:
